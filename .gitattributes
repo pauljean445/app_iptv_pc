@@ -1,0 +1,8 @@
+# Fins de ligne normalisées dans le dépôt
+* text=auto
+# Scripts Windows : CRLF obligatoire pour cmd.exe ; scripts Unix : LF
+*.bat text eol=crlf
+*.sh text eol=lf
+# Binaires
+*.ico binary
+*.png binary

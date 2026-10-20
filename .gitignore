@@ -1,0 +1,16 @@
+# Environnement Python (recréé par run_windows.bat / build_windows.bat)
+.venv/
+__pycache__/
+*.pyc
+
+# Application compilée et fichiers de PyInstaller (recréés par build_windows.bat)
+dist/
+build/
+*.spec
+
+# Divers
+*.log
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

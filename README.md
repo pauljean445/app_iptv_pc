@@ -9,6 +9,8 @@ iptv_player/
 ├─ main.py                 lanceur (python main.py)
 ├─ run_windows.bat         lancer depuis les sources (Windows)
 ├─ build_windows.bat       créer l'application dans dist\IPTVPlayer
+├─ build_installer.bat     créer l'installeur dist\IPTVPlayer-Setup-<version>.exe (appli + VLC)
+├─ installer/              IPTVPlayer.iss (script Inno Setup de l'installeur)
 ├─ requirements.txt
 ├─ assets/                 logo.svg (source) et icon.ico
 ├─ iptvplayer/             code de l'application
@@ -22,7 +24,7 @@ iptv_player/
 │  ├─ config.py            réglages et fichiers de données
 │  └─ sources/             catalogue : playlist.py (M3U), xtream.py (API Xtream),
 │                          catalog.py (cache disque), omdb.py (notes IMDb)
-├─ tools/                  make_icon.py, slim_dist.bat, build_windows_debug.bat, build_linux_mac.sh
+├─ tools/                  make_icon.py, slim_dist.bat, bundle_vlc.bat, build_windows_debug.bat, build_linux_mac.sh
 ├─ dist/                   application compilée (générée)
 └─ .venv/                  environnement Python (généré)
 ```
@@ -46,10 +48,22 @@ iptv_player/
 - Linux / macOS : `./tools/build_linux_mac.sh` → `dist/IPTVPlayer/IPTVPlayer`
 
 Le dossier `dist\IPTVPlayer` est autonome : on peut le déplacer où l'on veut, et supprimer `.venv` (~235 Mo) si on ne lance plus l'appli depuis les sources.
-L'exécutable nécessite toujours que **VLC soit installé** sur la machine qui le lance.
+Ce dossier seul nécessite que **VLC soit installé** sur la machine qui le lance (voir l'installeur ci-dessous pour s'en passer).
 Le script compile en mode « dossier » (pas `--onefile`, qui décompresse tout à chaque lancement) puis `tools/slim_dist.bat` retire les fichiers Qt inutiles.
 Logo : `assets/logo.svg` (source) et `assets/icon.ico` (icône de la fenêtre et de l'exécutable). Si le logo change, régénérer l'icône avec `.venv\Scripts\python.exe tools\make_icon.py`.
 Certains antivirus signalent à tort les exécutables PyInstaller : c'est un faux positif connu.
+
+## Créer l'installeur Windows (pour installer l'appli sur un autre PC)
+`build_installer.bat [version]` (ex. `build_installer.bat 1.2.0`) → `dist\IPTVPlayer-Setup-<version>.exe` (~53 Mo).
+Cet installeur contient tout : l'application **et VLC** (rien d'autre à installer sur le PC cible). Il crée les raccourcis (menu Démarrer, bureau en option) et une entrée de désinstallation ; par défaut il s'installe pour l'utilisateur courant, sans droits administrateur. Une mise à jour = lancer le nouvel installeur par-dessus ; les réglages (`%APPDATA%`) sont conservés.
+
+Prérequis sur le PC qui **crée** l'installeur :
+- ceux de `build_windows.bat` ;
+- **VLC 64 bits** installé (copié dans `dist\IPTVPlayer\vlc` par `tools\bundle_vlc.bat`, sans `plugins\gui`) ; autre dossier VLC : `set VLC_DIR=C:\chemin\vers\vlc` avant de lancer le script ;
+- **Inno Setup 6** : `winget install JRSoftware.InnoSetup`. Le script de l'installeur est `installer\IPTVPlayer.iss`.
+
+L'installeur n'est pas signé : au premier lancement, Windows SmartScreen peut afficher « Windows a protégé votre ordinateur » → *Informations complémentaires* → *Exécuter quand même*.
+VLC est sous licence GPL/LGPL : son fichier `COPYING.txt` est inclus dans `vlc\`.
 
 ## Utilisation
 Pas de barre de menus : toutes les commandes sont dans le bouton **☰** en haut à droite, et les raccourcis clavier restent actifs.

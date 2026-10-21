@@ -7,7 +7,7 @@ import traceback
 import unicodedata
 from datetime import datetime
 
-from . import config
+from . import __version__, config
 
 # --- Journal et affichage des erreurs ---------------------------------------
 # Dans l'exécutable (mode --windowed) il n'y a pas de console : sans ceci, une erreur
@@ -66,6 +66,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -77,11 +78,11 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from . import cast, library, ui, vlc_loader
+from . import cast, library, power, ui, update, vlc_loader
 from . import tracks as tracklib
 from .images import ImageLoader
 from .sources import catalog, omdb, playlist, xtream
-from .widgets import (ConnectionDialog, ControlsOverlay, GroupCombo, ItemModel, ManageProfilesDialog,
+from .widgets import (ConnectionDialog, ControlsOverlay, GroupCombo, ItemList, ItemModel, ManageProfilesDialog,
                       ProfileDialog, ProfilePicker, SeekSlider, ShortcutsDialog, SideMenu, VideoFrame)
 
 
@@ -117,8 +118,8 @@ def fmt_time(ms: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-_KEY_NAMES = {"Space": "Espace", "Left": "←", "Right": "→", "PgUp": "Page préc.", "PgDown": "Page suiv.",
-              "Backspace": "Retour arrière", "Esc": "Échap", "Home": "Début", "Shift": "Maj"}
+_KEY_NAMES = {"Space": "Espace", "Left": "←", "Right": "→", "Up": "↑", "Down": "↓", "PgUp": "Page préc.",
+              "PgDown": "Page suiv.", "Backspace": "Retour arrière", "Esc": "Échap", "Home": "Début", "Shift": "Maj"}
 
 
 def _key_label(key: str) -> str:
@@ -258,6 +259,9 @@ class MainWindow(QMainWindow):
         self.track_pref: dict = {}        # pistes choisies pour le flux en cours : {"audio": id, "spu": id}
         self.cast_compat = set(self.cfg.get("cast_compat", []))  # chaînes diffusées en « mode compatible »
         self._pending_seek = None         # position à rejoindre si la reprise demandée est ignorée
+        self._offset_ms = 0               # replay : le flux ouvert commence à cette position du programme
+        self._seek_target = None          # position demandée, appliquée après une courte pause (clics groupés)
+        self._seek_hold = None            # (position, échéance) affichée le temps que la lecture la rejoigne
         self._stream_start_pos = 0        # position de départ du flux en cours (ms)
         self._live_delay = 0.0            # direct : retard accumulé par les pauses (secondes)
         self._paused_at = None            # direct : début de la pause en cours (time.monotonic)
@@ -298,10 +302,12 @@ class MainWindow(QMainWindow):
         # Barre de progression + mémorisation de la position (films, épisodes)
         self.ui_timer = QTimer(self)
         self.ui_timer.setInterval(500)
+        self.ui_timer.timeout.connect(self._update_power)  # en premier : il agit avant _update_seek au réveil
         self.ui_timer.timeout.connect(self._update_seek)
         self.ui_timer.timeout.connect(self._sync_play_icon)
         self.ui_timer.timeout.connect(self._update_live_badge)
         self._play_icon_playing = None
+        self._last_tick = time.time()
         self.ui_timer.start()
 
         # Fin d'un épisode / d'un replay : la suite démarre après quelques secondes
@@ -309,6 +315,13 @@ class MainWindow(QMainWindow):
         self.next_timer.setSingleShot(True)
         self.next_timer.setInterval(AUTO_NEXT_MS)
         self.next_timer.timeout.connect(self._play_auto_next)
+
+        # Diffusion : chaque déplacement fait recharger la vidéo à la télé (plusieurs secondes). Les clics
+        # rapprochés (± 10 s, barre de progression) sont regroupés en un seul déplacement.
+        self.seek_timer = QTimer(self)
+        self.seek_timer.setSingleShot(True)
+        self.seek_timer.setInterval(900)
+        self.seek_timer.timeout.connect(self._apply_seek)
 
         # Langues de la fiche : lues après une courte pause (pas pour chaque ligne parcourue au clavier)
         self.tracks_timer = QTimer(self)
@@ -451,7 +464,7 @@ class MainWindow(QMainWindow):
         self.group_combo.currentIndexChanged.connect(self._on_group_changed)
 
         self.model = ItemModel(lambda it: it.name, lambda it: None)
-        self.list = QListView()
+        self.list = ItemList()
         self.list.setObjectName("itemList")
         # Lignes dessinées sur mesure : vignette, titre, infos, progression, badges
         self.list_delegate = ui.ListDelegate(self.images, self._row, self.list)
@@ -469,6 +482,7 @@ class MainWindow(QMainWindow):
         self.list.selectionModel().currentChanged.connect(self._on_current_changed)
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._context_menu)
+        self.list.moved.connect(self._move_favorite)
 
         # Fiche en grand : elle occupe la partie droite (à la place de la vidéo) hors lecture
         self.details = ui.DetailsPage()
@@ -581,17 +595,17 @@ class MainWindow(QMainWindow):
         sk = QHBoxLayout(self.seek_buttons)
         sk.setContentsMargins(12, 0, 0, 0)
         sk.setSpacing(2)
-        for name, delta, tip in (("back30", -30000, "Reculer de 30 s"), ("back10", -10000, "Reculer de 10 s  (←)"),
-                                 ("fwd10", 10000, "Avancer de 10 s  (→)"), ("fwd30", 30000, "Avancer de 30 s")):
+        self._seek_btns = []
+        for delta in (-30000, -10000, 10000, 30000):
             b = QToolButton()
             b.setObjectName("pbtn")
-            b.setIcon(ui.icon(name))
             b.setIconSize(QSize(26, 26))
-            b.setToolTip(tip)
             b.setFocusPolicy(Qt.NoFocus)
             b.setCursor(Qt.PointingHandCursor)
             b.clicked.connect(lambda _=False, d=delta: self.seek_by(d))
             sk.addWidget(b)
+            self._seek_btns.append(b)
+        self._set_seek_buttons(minutes=False)
         self.seek_buttons.hide()
         cl.addWidget(self.seek_buttons)
 
@@ -1015,6 +1029,8 @@ class MainWindow(QMainWindow):
         a("Affichage", "Rechercher", "Ctrl+F", self._focus_search)
         a("Affichage", "Retour", ["Backspace", "Alt+Left"], self.go_back)
         a("Affichage", "Ajouter / retirer des favoris", "Ctrl+D", self.toggle_favorite_selected)
+        a("Affichage", "Monter le favori (★ Favoris)", "Ctrl+Up", lambda: self.move_favorite_selected(-1))
+        a("Affichage", "Descendre le favori (★ Favoris)", "Ctrl+Down", lambda: self.move_favorite_selected(+1))
         a("Affichage", "Accueil", ["Ctrl+H", "Alt+Home"], self.show_home)
         self.side_menu = None
 
@@ -1027,9 +1043,78 @@ class MainWindow(QMainWindow):
             [("plug", "Connexion IPTV", self.open_connection), ("reload", "Recharger", self.reload_playlist),
              ("fullscreen", "Plein écran", self.toggle_fullscreen)],
             [[("star", "Notes IMDb (clé OMDb)", "", self.set_omdb_key),
-              ("keyboard", "Raccourcis clavier", "?", self.show_shortcuts)],
+              ("keyboard", "Raccourcis clavier", "?", self.show_shortcuts),
+              ("download", "Mise à jour", f"v{__version__}", lambda: self.check_update(silent=False))],
              [("quit", "Quitter", "Ctrl+Q", self.close)]])
         self.side_menu.open_beside(self, self.header)
+
+    # ---- Mise à jour de l'application ---------------------------------- #
+    def check_update(self, silent: bool):
+        """Cherche une version plus récente ; silent : au démarrage, rien n'est affiché s'il n'y en a pas."""
+        if not update.supported():
+            if not silent:
+                QMessageBox.information(self, "Mise à jour",
+                                        "La mise à jour depuis l'appli concerne la version installée "
+                                        "(installeur), pas le lancement depuis les sources.")
+            return
+
+        def done(info):
+            if info is None:
+                if not silent:
+                    QMessageBox.information(self, "Mise à jour", f"Tu as la dernière version ({__version__}).")
+                return
+            notes = info["notes"][:1200]
+            box = QMessageBox(QMessageBox.Question, "Mise à jour disponible",
+                              f"La version {info['version']} est disponible (tu as la {__version__}).\n\n"
+                              "L'appli va la télécharger, se fermer puis se relancer d'elle-même. "
+                              "Tes réglages, favoris et reprises de lecture sont conservés.", parent=self)
+            if notes:
+                box.setDetailedText(notes)
+            install = box.addButton("Mettre à jour", QMessageBox.AcceptRole)
+            box.addButton("Plus tard", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is install:
+                self._download_update(info)
+
+        def failed(msg):
+            if not silent:
+                QMessageBox.warning(self, "Mise à jour", f"Impossible de vérifier les mises à jour : {msg}.")
+
+        run_async(update.check, done, failed)
+
+    def _download_update(self, info: dict):
+        dlg = QProgressDialog(f"Téléchargement de la version {info['version']}…", "Annuler", 0, 100, self)
+        dlg.setWindowTitle("Mise à jour")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setValue(0)
+        cancel = threading.Event()
+        dlg.canceled.connect(cancel.set)
+
+        def progress(value):
+            got, total = value
+            if total and not cancel.is_set():
+                dlg.setValue(int(got * 100 / total))
+
+        def done(path):
+            dlg.close()
+            try:
+                update.install(path)
+            except OSError as exc:
+                QMessageBox.warning(self, "Mise à jour", f"Impossible de lancer l'installeur : {exc}")
+                return
+            self.close()  # sauvegarde la position de lecture et les réglages
+            QApplication.instance().quit()
+
+        def failed(msg):
+            dlg.close()
+            if not cancel.is_set():
+                QMessageBox.warning(self, "Mise à jour", f"Le téléchargement a échoué : {msg}.")
+
+        run_async(lambda: update.download(info, lambda got, total: _emit(progress, (got, total)), cancel.is_set),
+                  done, failed)
 
     def show_shortcuts(self):
         order = ("Lecture", "Affichage", "Général")
@@ -1042,6 +1127,8 @@ class MainWindow(QMainWindow):
             self._load(src, use_cache=True)  # lecture du cache et…
         self._build_vlc_async()              # … initialisation de VLC, chacune dans un thread
         QTimer.singleShot(2500, self._scan_cast)  # appareils de diffusion prêts avant le 1er clic
+        if update.supported():
+            QTimer.singleShot(8000, lambda: self.check_update(silent=True))
         if not src:
             self.open_connection()
 
@@ -1219,6 +1306,8 @@ class MainWindow(QMainWindow):
         if self.view == "list":
             self.tab_group[self.tab] = self.group_combo.currentData()
         self._apply_filter()
+        if self.model.reorderable:
+            self.statusBar().showMessage("Glisse un favori pour changer l'ordre (ou Ctrl+↑ / Ctrl+↓)", 6000)
 
     def _populate_groups(self, selected=ALL):
         combo = self.group_combo
@@ -1260,6 +1349,8 @@ class MainWindow(QMainWindow):
         poster = self.view == "episodes" or (self.view == "list" and self.tab in ("movie", "series"))
         self.list_delegate.set_mode(poster)
         keep = self.details_item.key if self.details_item is not None else None
+        # Ordre des favoris modifiable, sauf pendant une recherche (on ne verrait pas tous les voisins)
+        self.list.set_reorderable(self.view == "list" and group == FAV and not text and len(items) > 1)
         self.model.set_items(items)
         self.count_label.setText(f"{len(items)} / {len(base)}")
         if not self._select_current() and keep:
@@ -1668,6 +1759,23 @@ class MainWindow(QMainWindow):
         if self.details_item is not None:
             self._show_details(self.details_item)
 
+    def _move_favorite(self, row: int, dest: int):
+        """★ Favoris : la ligne row passe à la position d'insertion dest (0 = en tête, len = à la fin)."""
+        items = self.model.items
+        if not self.model.reorderable or not 0 <= row < len(items) or dest in (row, row + 1):
+            return
+        key = items[row].key
+        self.library.move_favorite(self.tab, key, items[dest].key if dest < len(items) else None)
+        self._apply_filter()
+        self._select_key(key)
+        if self.tab in ("live", "replay"):  # bandes de l'accueil dans le même ordre
+            self._refresh_home()
+
+    def move_favorite_selected(self, delta: int):
+        idx = self.list.currentIndex()
+        if self.model.reorderable and idx.isValid() and 0 <= idx.row() + delta < len(self.model.items):
+            self._move_favorite(idx.row(), idx.row() + (delta if delta < 0 else delta + 1))
+
     def toggle_favorite_selected(self):
         idx = self.list.currentIndex()
         if idx.isValid():
@@ -1702,6 +1810,15 @@ class MainWindow(QMainWindow):
         recent_key = it.parent.key if it.kind == "episode" else it.key
         if recent_key in lib.recent:
             menu.addAction("Retirer de « Vu récemment »", lambda: self._remove_recent(recent_key))
+        if self.model.reorderable:
+            row, last = idx.row(), len(self.model.items) - 1
+            menu.addSeparator()
+            if row > 0:
+                menu.addAction("Mettre en premier", lambda: self._move_favorite(row, 0))
+                menu.addAction("Monter\tCtrl+↑", lambda: self.move_favorite_selected(-1))
+            if row < last:
+                menu.addAction("Descendre\tCtrl+↓", lambda: self.move_favorite_selected(+1))
+                menu.addAction("Mettre en dernier", lambda: self._move_favorite(row, last + 1))
         menu.exec(self.list.viewport().mapToGlobal(pos))
 
     def _set_watched(self, ep: playlist.Item, watched: bool):
@@ -1833,6 +1950,7 @@ class MainWindow(QMainWindow):
         self.video.set_idle(False)
         self.seek_row.setVisible(it.kind in SEEKABLE)
         self.seek_buttons.setVisible(it.kind in SEEKABLE)
+        self._set_seek_buttons(minutes=it.kind == "program")
         self._update_next_btn()
         self.live_badge.setVisible(it.kind == "live")
         self.audio_btn.setEnabled(True)
@@ -1996,8 +2114,17 @@ class MainWindow(QMainWindow):
         if self.player is None:
             self._build_vlc()
         self._embed()
-        media = self.instance.media_new(self.current.url)
-        if start_ms > 0:
+        it = self.current
+        url, self._offset_ms = it.url, 0
+        if it.kind == "program" and start_ms >= 60000:
+            # Replay : VLC ne connaît pas sa durée et ignore « start-time » (retour au début). On demande au
+            # serveur le replay qui commence à la bonne minute : il ne sait se placer qu'à la minute (voir
+            # seek_by), on reprend donc au début de la minute en cours.
+            shifted = xtream.shift_timeshift_url(url, start_ms // 60000)
+            if shifted:
+                url, self._offset_ms = shifted, start_ms // 60000 * 60000
+        media = self.instance.media_new(url)
+        if start_ms > 0 and it.kind != "program":
             media.add_option(f":start-time={start_ms / 1000:.1f}")
         # Pistes choisies par l'utilisateur (conservées après une reconnexion ou un changement d'écran)
         if self.track_pref.get("audio") is not None:
@@ -2009,7 +2136,13 @@ class MainWindow(QMainWindow):
             # Sous-titres désactivés. « sub-track-id=-1 » ne suffit pas : VLC remet la piste par défaut
             # du fichier (souvent « Forcés »). Ils restent réactivables pendant la lecture.
             media.add_option(":sub-language=none")
-        self._pending_seek = start_ms if start_ms > 15000 else None
+        self._pending_seek = None
+        if it.kind == "program":
+            self.last_pos = self._offset_ms
+        else:
+            self._pending_seek = start_ms if start_ms > 15000 else None
+        self._seek_target, self._seek_hold = None, None
+        self.seek_timer.stop()
         self._live_delay, self._paused_at = 0.0, None  # un flux (re)lancé repart du direct
         if self.cast_target is not None:  # la vidéo part vers la télé au lieu de s'afficher ici
             live = self.current.kind in ("live", "program")
@@ -2027,7 +2160,8 @@ class MainWindow(QMainWindow):
         self.player.set_media(media)
         self.player.play()
         self.last_play_ts = time.time()
-        self._stream_start_pos = start_ms  # pour distinguer un échec de diffusion d'une fin de lecture
+        # Pour distinguer un échec de diffusion d'une fin de lecture
+        self._stream_start_pos = self._offset_ms if it.kind == "program" else start_ms
 
     def zap(self, delta: int):
         items = self.play_list or self.model.items
@@ -2218,18 +2352,125 @@ class MainWindow(QMainWindow):
                 self.want_playing = False
                 self.statusBar().showMessage(f"Flux indisponible : {name}. Essayez une autre chaîne.")
 
-    # ---- Navigation dans les films / épisodes / replays ------------------- #
-    def seek_by(self, delta_ms: int):
-        if self.current is None or self.current.kind not in SEEKABLE:
+    def _update_power(self):
+        """Toutes les 0,5 s : pas de veille pendant une lecture (ou une diffusion, même en pause) ;
+        au réveil du PC, le flux est relancé là où il en était."""
+        now = time.time()
+        slept = now - self._last_tick > 20  # les minuteurs sont arrêtés pendant la veille
+        self._last_tick = now
+        if self.player is None or self.current is None:
+            power.keep_awake(False)
             return
-        t = self.player.get_time()
+        state = self.player.get_state()
+        if slept and self.want_playing and state != vlc.State.Paused and now - self.last_play_ts > 5:
+            # La connexion au serveur (et à la télé) n'a pas survécu à la veille. On repart de la position
+            # d'avant la veille : celle que VLC donne au réveil est souvent fausse (retour au début).
+            self.retries = 0
+            self._start_stream(self.last_pos if self.current.kind in SEEKABLE else 0)
+            self.statusBar().showMessage(f"Reprise après la mise en veille : {self.current.name}", 6000)
+        power.keep_awake(self.want_playing and (self.cast_target is not None or state == vlc.State.Playing))
+
+    # ---- Navigation dans les films / épisodes / replays ------------------- #
+    def _item_ms(self) -> int:
+        """Replay : durée du programme (guide des programmes), que VLC ne connaît pas ; sinon 0."""
+        it = self.current
+        if it is not None and it.kind == "program" and it.end > it.start:
+            return int((it.end - it.start) * 1000)
+        return 0
+
+    def _cur_ms(self) -> int:
+        """Position dans le film / l'épisode / le programme (ms), -1 si inconnue."""
+        t = self.player.get_time() if self.player is not None else -1
+        return t + self._offset_ms if t and t > 0 else -1
+
+    def _shown_ms(self):
+        """Position demandée, affichée tant que la lecture ne l'a pas rejointe (sinon None)."""
+        if self._seek_target is not None:
+            return self._seek_target
+        if self._seek_hold is not None:
+            ms, until = self._seek_hold
+            if time.time() < until and abs(self._cur_ms() - ms) > 15000:
+                return ms
+            self._seek_hold = None
+        return None
+
+    def _set_seek_buttons(self, minutes: bool):
+        """Boutons de déplacement : ± 10 s / 30 s, ou ± 1 min / 5 min pour un replay (voir seek_by)."""
+        if minutes:
+            rows = (("back5m", "Reculer de 5 min"), ("back1m", "Reculer de 1 min  (←)"),
+                    ("fwd1m", "Avancer de 1 min  (→)"), ("fwd5m", "Avancer de 5 min"))
+        else:
+            rows = (("back30", "Reculer de 30 s"), ("back10", "Reculer de 10 s  (←)"),
+                    ("fwd10", "Avancer de 10 s  (→)"), ("fwd30", "Avancer de 30 s"))
+        for b, (name, tip) in zip(self._seek_btns, rows):
+            b.setIcon(ui.icon(name))
+            b.setToolTip(tip)
+
+    def seek_by(self, delta_ms: int):
+        if self.current is None or self.current.kind not in SEEKABLE or self.player is None:
+            return
+        shown = self._shown_ms()  # clics rapprochés : ils s'ajoutent
+        t = shown if shown is not None else self._cur_ms()
         if t < 0:
             return
-        self.player.set_time(max(0, t + delta_ms))
+        if self._item_ms():
+            # Replay : le serveur découpe l'enregistrement en blocs d'une minute et renvoie toujours le début
+            # d'un bloc, même pour un endroit précis du fichier (vérifié octet par octet). Un saut de 10 s est
+            # donc impossible : les boutons et ←/→ avancent d'une minute, les autres de 5 minutes.
+            step = 60000 if abs(delta_ms) <= 10000 else 300000
+            self._request_seek(t // 60000 * 60000 + (step if delta_ms > 0 else -step))
+        else:
+            self._request_seek(t + delta_ms)
 
     def _on_seek(self, fraction: float):
-        if self.current is not None and self.current.kind in SEEKABLE:
-            self.player.set_position(max(0.0, min(1.0, fraction)))
+        if self.current is None or self.current.kind not in SEEKABLE or self.player is None:
+            return
+        fraction = max(0.0, min(1.0, fraction))
+        total = self._item_ms() or self.player.get_length()
+        if total > 0 and self._item_ms():
+            self._request_seek(round(fraction * total / 60000) * 60000)  # replay : minute la plus proche
+        elif total > 0:
+            self._request_seek(int(fraction * total))
+        else:
+            self.player.set_position(fraction)
+
+    def _request_seek(self, ms: int):
+        prog = self._item_ms()
+        total = prog or self.player.get_length()
+        end = (total - 60000) // 60000 * 60000 if prog else total - 3000  # replay : dernière minute entière
+        ms = max(0, min(ms, end) if total > 0 else ms)
+        # Sur le PC, un déplacement dans un film est immédiat. Ailleurs, chaque déplacement relance la
+        # lecture (replay : nouveau flux ; télé : rechargement) : les clics rapprochés n'en font qu'un.
+        if self.cast_target is None and not prog:
+            self._seek_to(ms)
+            return
+        self._seek_target = ms
+        self.seek_timer.setInterval(900 if self.cast_target is not None else 450)
+        self.seek_timer.start()  # relancé à chaque clic
+        self._show_position(ms, total)
+        self.statusBar().showMessage(f"Déplacement à {fmt_time(ms)}…", 4000)
+
+    def _apply_seek(self):
+        ms, self._seek_target = self._seek_target, None
+        if ms is None or self.current is None or self.player is None:
+            return
+        self._seek_to(ms)
+        self._seek_hold = (ms, time.time() + 30)
+        if self.cast_target is not None:
+            self.statusBar().showMessage(f"La télé se place à {fmt_time(ms)}…", 8000)
+
+    def _seek_to(self, ms: int):
+        """Déplacement immédiat à ms (position dans l'élément en cours)."""
+        if self._item_ms():  # replay : flux demandé au serveur à partir de cette minute
+            self.retries = 0
+            self._start_stream(ms)
+        else:
+            self.player.set_time(ms)
+
+    def _show_position(self, ms: int, total: int):
+        if not self.seek.dragging and total > 0:
+            self.seek.setValue(int(min(ms, total) * 1000 / total))
+        self.time_cur.setText(fmt_time(ms))
 
     def _update_seek(self):
         if self.player is None or self.current is None or self.current.kind not in SEEKABLE:
@@ -2238,13 +2479,18 @@ class MainWindow(QMainWindow):
         if state == vlc.State.Ended and self.want_playing:
             self._check_player()  # fin détectée en 0,5 s au lieu de 2 s : la suite démarre plus tôt
             return
-        t = self.player.get_time()
+        t = self._cur_ms()
         length = self.player.get_length()
+        prog = self._item_ms()
+        if prog:
+            length = prog
+            if t < 0:
+                t = self._offset_ms  # replay en cours de lancement : il commence là
         if self._pending_seek is not None:
             # Relance (diffusion, changement de langue) : si la lecture a repris trop tôt, on y retourne
-            if state == vlc.State.Playing and t and t > 0:
+            if state == vlc.State.Playing and t > 0:
                 if t < self._pending_seek - 15000:
-                    self.player.set_time(self._pending_seek)
+                    self._seek_to(self._pending_seek)
                 self._pending_seek = None
             return
         if state in (vlc.State.Playing, vlc.State.Paused) and t and t > 0:
@@ -2255,11 +2501,15 @@ class MainWindow(QMainWindow):
                 self._save_progress(finished=False)
         if self.seek.dragging or not self.seek_row.isVisible():
             return
+        self.time_total.setText(fmt_time(length) if length and length > 0 else "--:--")
+        shown = self._shown_ms()
+        if shown is not None or (length and length > 0):
+            self._show_position(shown if shown is not None else max(t, 0), length)
+            return
         pos = self.player.get_position()
         if pos is not None and pos >= 0:
             self.seek.setValue(int(pos * 1000))
         self.time_cur.setText(fmt_time(max(t, 0)))
-        self.time_total.setText(fmt_time(length) if length and length > 0 else "--:--")
 
     # ---- Diffusion vers une télé (Google Cast) ------------------------------ #
     def _on_cast_menu(self):
@@ -2505,6 +2755,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         for timer in (self.ui_timer, self.watchdog, self.fs_timer, self.next_timer, self.tracks_timer):
             timer.stop()
+        power.keep_awake(False)
         self._exit_fullscreen()
         if not self._switched:
             self.cfg["window_geometry"] = bytes(self.saveGeometry().toHex()).decode()

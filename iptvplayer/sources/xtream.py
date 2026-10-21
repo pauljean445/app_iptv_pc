@@ -9,7 +9,7 @@ import json
 import math
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote, unquote
 
 from .playlist import Item, http_get, normalize_server
@@ -269,6 +269,22 @@ class XtreamClient:
             ))
         programs.sort(key=lambda p: p.start, reverse=True)
         return programs
+
+
+_TIMESHIFT_RE = re.compile(r"^(.*/timeshift/[^/]+/[^/]+/)(\d+)/(\d{4}-\d{2}-\d{2}):(\d{2})-(\d{2})/([^/]+)$")
+
+
+def shift_timeshift_url(url: str, minutes: int) -> str | None:
+    """Même replay commençant minutes plus tard (le serveur ne gère que la minute, pas la seconde) :
+    il commence directement au bon endroit, sans que VLC ait à se déplacer dans le flux."""
+    m = _TIMESHIFT_RE.match(url)
+    if m is None or minutes <= 0:
+        return None
+    head, length, day, hh, mm, tail = m.groups()
+    if int(length) - minutes < 1:
+        return None
+    start = datetime.strptime(f"{day} {hh}:{mm}", "%Y-%m-%d %H:%M") + timedelta(minutes=minutes)
+    return f"{head}{int(length) - minutes}/{start:%Y-%m-%d:%H-%M}/{tail}"
 
 
 _STREAM_RE = re.compile(r"^(https?://[^/]+)/(?:live/)?([^/]+)/([^/]+)/(\d+)(?:\.\w+)?$", re.IGNORECASE)

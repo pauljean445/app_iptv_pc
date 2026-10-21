@@ -53,6 +53,16 @@ class Library:
     def favorite_keys(self, tab: str) -> list[str]:
         return list(self.favorites.get(tab, []))
 
+    def move_favorite(self, tab: str, key: str, before: str | None) -> None:
+        """Change l'ordre des favoris : key passe juste avant before (à la fin si None)."""
+        keys = self.favorites.get(tab, [])
+        if key not in keys or key == before:
+            return
+        keys.remove(key)
+        keys.insert(keys.index(before) if before in keys else len(keys), key)
+        self.dirty = True
+        self.save()
+
     # ---- Reprise de lecture ----------------------------------------------- #
     def resume_position(self, key: str) -> int:
         p = self.progress.get(key)

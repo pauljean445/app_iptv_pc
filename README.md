@@ -19,6 +19,8 @@ iptv_player/
 │  ├─ widgets.py           composants : zone vidéo, barres flottantes, connexion, modèle de liste
 │  ├─ vlc_loader.py        recherche et chargement de libVLC
 │  ├─ cast.py              diffusion Google Cast (découverte des télés, options VLC)
+│  ├─ power.py             pas de mise en veille du PC pendant une lecture / une diffusion
+│  ├─ update.py            mise à jour depuis l'appli (releases GitHub)
 │  ├─ library.py           favoris, reprises de lecture, « Vu récemment »
 │  ├─ images.py            affiches et logos (téléchargement, cache)
 │  ├─ config.py            réglages et fichiers de données
@@ -54,8 +56,20 @@ Logo : `assets/logo.svg` (source) et `assets/icon.ico` (icône de la fenêtre et
 Certains antivirus signalent à tort les exécutables PyInstaller : c'est un faux positif connu.
 
 ## Créer l'installeur Windows (pour installer l'appli sur un autre PC)
-`build_installer.bat [version]` (ex. `build_installer.bat 1.2.0`) → `dist\IPTVPlayer-Setup-<version>.exe` (~53 Mo).
+`build_installer.bat` → `dist\IPTVPlayer-Setup-<version>.exe` (~53 Mo). La version est `__version__` dans `iptvplayer/__init__.py` : l'augmenter avant chaque nouvel installeur (l'appli s'en sert pour savoir si elle est à jour).
 Cet installeur contient tout : l'application **et VLC** (rien d'autre à installer sur le PC cible). Il crée les raccourcis (menu Démarrer, bureau en option) et une entrée de désinstallation ; par défaut il s'installe pour l'utilisateur courant, sans droits administrateur. Une mise à jour = lancer le nouvel installeur par-dessus ; les réglages (`%APPDATA%`) sont conservés.
+
+### Mise à jour depuis l'appli
+L'appli installée cherche une nouvelle version 8 s après le démarrage (et via *☰ > Mise à jour*). Si elle en trouve une, elle propose de la télécharger, lance l'installeur en mode silencieux, se ferme, puis l'installeur la relance (réglages, favoris et reprises conservés).
+
+Les versions viennent de la page *Releases* du dépôt GitHub `pauljean445/app_iptv_pc` (constante `REPO` dans `iptvplayer/update.py`), qui doit être **public** : un dépôt privé n'est pas accessible sans identifiants. Pour garder le code privé, créer un dépôt public vide servant seulement aux installeurs et y faire pointer `REPO`.
+
+Publier une version :
+1. augmenter `__version__` dans `iptvplayer/__init__.py` (ex. `1.2.0`) ;
+2. lancer `build_installer.bat` ;
+3. sur GitHub : *Releases* > *Draft a new release*, tag `v1.2.0`, joindre `dist\IPTVPlayer-Setup-1.2.0.exe`, décrire les nouveautés (affichées dans l'appli), *Publish release*.
+
+Une version installée avant la 1.1.0 ne sait pas se mettre à jour : installer une fois la 1.1.0 à la main.
 
 Prérequis sur le PC qui **crée** l'installeur :
 - ceux de `build_windows.bat` ;
@@ -89,7 +103,7 @@ Quatre onglets :
 - **Replays** : les chaînes en direct qui proposent le replay (durée entre parenthèses) ; double-clic → programmes passés (filtre par jour), double-clic pour les regarder. Clic droit → « Regarder en direct ».
 
 Dans chaque onglet, la liste des catégories propose aussi :
-- **★ Favoris** : `Ctrl+D`, clic droit ou bouton de la fiche pour ajouter / retirer.
+- **★ Favoris** : `Ctrl+D`, clic droit ou bouton de la fiche pour ajouter / retirer. Pour changer l'ordre : glisser-déposer une ligne, `Ctrl+↑` / `Ctrl+↓`, ou clic droit > Monter / Descendre / Mettre en premier / en dernier (pas pendant une recherche). L'ordre est repris dans les bandes Direct et Replays de l'accueil.
 - **🕘 Vu récemment** (Films et Séries) : les films et séries entamés, du plus récent au plus ancien. Film : double-clic pour **reprendre la lecture** là où elle s'était arrêtée (bouton « Depuis le début » dans la fiche). Série : bouton « Reprendre SxxEyy » de la fiche, ou double-clic pour ouvrir les épisodes, l'épisode en cours étant présélectionné (▶ % dans la liste, ✓ = vu). Un film disparaît de la liste quand il est vu jusqu'au bout ; une série quand tous ses épisodes sont vus (clic droit sur un épisode : « Marquer comme vu »).
 
 **Notes IMDb** : le fournisseur donne une note (souvent TMDB). Pour afficher la vraie note IMDb, crée une clé gratuite sur https://www.omdbapi.com/apikey.aspx et saisis-la dans *☰ > Clé OMDb*. Les notes sont mises en cache (limite de 1000 requêtes / jour pour la clé gratuite).
@@ -97,6 +111,8 @@ Dans chaque onglet, la liste des catégories propose aussi :
 Playlist M3U simple (hors Xtream) : un flux sans extension vidéo (.ts, .m3u8) est classé en direct ; les fichiers vidéo (.mkv, .mp4…) en films, ou en épisodes s'ils contiennent `SxxEyy` (ou si le groupe contient un mot de `series_keywords` dans `settings.json`).
 
 Films, épisodes et replays ont une barre de progression (clic pour se déplacer) ; `Maj+←` / `Maj+→` reculent / avancent de 10 s.
+
+**Replays : déplacement à la minute.** Le serveur découpe les enregistrements en blocs d'une minute et renvoie toujours le début d'un bloc, même quand on lui demande un endroit précis du fichier (vérifié octet par octet). VLC, qui ne connaît pas la durée d'un replay, ignore en plus les demandes « aller à telle heure ». L'appli demande donc au serveur le replay qui commence à la minute voulue : les boutons et `←` / `→` avancent / reculent d'une minute, les grands boutons de 5 minutes, et un clic sur la barre va à la minute la plus proche. Les clics rapprochés sont regroupés en un seul déplacement. Une relance (passage sur la télé, reconnexion) reprend au début de la minute en cours.
 
 **Langues et sous-titres** : la fiche d'un film, d'une série ou d'un épisode liste les langues et sous-titres du fichier (lus en 1 à 4 s). Un bouton de langue lance la lecture dans cette langue (pour une série : l'épisode que « Lire » lancerait, le premier si elle n'est pas commencée) ; les sous-titres se choisissent avant. Le choix, fait sur la fiche ou pendant la lecture, est mémorisé par film et par série (`track_prefs` dans `settings.json`) et appliqué aux épisodes suivants, même quand l'ordre des pistes change d'un fichier à l'autre.
 
@@ -109,6 +125,7 @@ Films, épisodes et replays ont une barre de progression (clic pour se déplacer
 - Une chaîne qui ne s'affiche pas sur la télé : menu Diffuser > **Mode compatible pour cette chaîne** (image convertie en H.264 720p et désentrelacée). Il s'active aussi tout seul si VLC détecte l'échec, et reste mémorisé pour la chaîne.
 - En cas d'échec, les erreurs de VLC sont dans `%APPDATA%\IPTVPlayer\vlc.log` (remis à zéro à chaque lancement).
 - La télé doit être allumée et sur le même réseau que le PC.
+- Pendant une diffusion (même en pause), le PC ne se met pas en veille et son écran reste allumé : c'est lui qui envoie la vidéo à la télé (sur les portables récents, un écran qui s'éteint tout seul met le PC en veille). L'écran d'un PC fixe peut être éteint à la main avec son bouton. Si le PC se met quand même en veille (capot fermé…), la lecture reprend au réveil là où elle s'était arrêtée.
 - La télé vient chercher la vidéo sur le PC : à la première diffusion, Windows demande d'autoriser IPTV Player dans le pare-feu. Accepte-le ; idéalement, mets ton réseau domestique en profil **Privé** (Paramètres > Réseau et Internet > Wi-Fi > ton réseau).
 
 Puis : recherche par nom (sans tenir compte des accents), filtre par catégorie, double-clic (ou Entrée) pour lancer.
@@ -126,6 +143,7 @@ Puis : recherche par nom (sans tenir compte des accents), filtre par catégorie,
 | F5 | Recharger la playlist |
 | Ctrl+K | Connexion IPTV |
 | Ctrl+D | Ajouter / retirer des favoris |
+| Ctrl+↑ / Ctrl+↓ | Monter / descendre le favori sélectionné (★ Favoris) |
 | Ctrl+H | Accueil |
 | N | Épisode suivant (séries) / programme suivant (replays) |
 | B / V | Langue suivante / sous-titres suivants |

@@ -1,7 +1,7 @@
 """Petits composants de l'interface : modèle de liste, zone vidéo, barre de progression,
 fenêtre de connexion et barres flottantes du plein écran."""
-from PySide6.QtCore import (QAbstractListModel, QEasingCurve, QModelIndex, QPoint, QPropertyAnimation, QRect,
-                            QSize, Qt, QTimer, Signal)
+from PySide6.QtCore import (QAbstractListModel, QEasingCurve, QMimeData, QModelIndex, QPoint, QPropertyAnimation,
+                            QRect, QSize, Qt, QTimer, Signal)
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -38,11 +38,31 @@ from .sources import playlist
 # Modèle de liste
 # --------------------------------------------------------------------------- #
 class ItemModel(QAbstractListModel):
+    MIME = "application/x-iptvplayer-row"
+
     def __init__(self, label_fn, icon_fn):
         super().__init__()
         self.items: list[playlist.Item] = []
         self.label_fn = label_fn
         self.icon_fn = icon_fn
+        self.reorderable = False  # lignes déplaçables à la souris (★ Favoris)
+
+    def flags(self, index):
+        f = super().flags(index)
+        if self.reorderable:
+            f |= Qt.ItemIsDragEnabled if index.isValid() else Qt.ItemIsDropEnabled  # dépôt entre les lignes
+        return f
+
+    def supportedDropActions(self):
+        return Qt.MoveAction
+
+    def mimeTypes(self):
+        return [self.MIME]
+
+    def mimeData(self, indexes):
+        data = QMimeData()
+        data.setData(self.MIME, str(indexes[0].row()).encode() if indexes else b"")
+        return data
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.items)
@@ -70,6 +90,37 @@ class ItemModel(QAbstractListModel):
     def refresh(self):
         if self.items:
             self.dataChanged.emit(self.index(0), self.index(len(self.items) - 1))
+
+
+class ItemList(QListView):
+    """Liste des entrées. Quand le modèle est « reorderable », une ligne se déplace par glisser-déposer :
+    moved(ligne, position d'insertion) ; c'est à l'appelant de changer l'ordre puis de recharger le modèle."""
+    moved = Signal(int, int)
+
+    def set_reorderable(self, on: bool):
+        self.model().reorderable = on
+        self.setDragDropMode(QListView.InternalMove if on else QListView.NoDragDrop)
+        self.setDefaultDropAction(Qt.MoveAction)
+
+    def dropEvent(self, event):
+        model = self.model()
+        if event.source() is not self or not model.reorderable or not event.mimeData().hasFormat(model.MIME):
+            event.ignore()
+            return
+        row = int(bytes(event.mimeData().data(model.MIME)).decode() or -1)
+        pos = event.position().toPoint()
+        idx = self.indexAt(pos)
+        dest = model.rowCount() if not idx.isValid() else \
+            idx.row() + (pos.y() > self.visualRect(idx).center().y())
+        # Accepté sans rien retirer du modèle (il ne sait pas supprimer de lignes) ; le déplacement se fait
+        # une fois le glisser-déposer terminé, car l'appelant recharge la liste.
+        event.setDropAction(Qt.MoveAction)
+        event.accept()
+        self.stopAutoScroll()
+        self.setState(QListView.NoState)
+        self.viewport().update()
+        if row >= 0:
+            QTimer.singleShot(0, lambda: self.moved.emit(row, dest))
 
 
 # --------------------------------------------------------------------------- #

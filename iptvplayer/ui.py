@@ -289,6 +289,8 @@ _GRID24 = {
     "edit": lambda p, c: _g24_poly(p, c, [(4, 20), (8, 20), (19, 9), (15, 5), (4, 16)], closed=True),
     "close": lambda p, c: _g24_poly(p, c, [(6, 6), (18, 18)], [(18, 6), (6, 18)]),
     "menu": lambda p, c: _g24_poly(p, c, [(4, 7), (20, 7)], [(4, 12), (20, 12)], [(4, 17), (20, 17)]),
+    "download": lambda p, c: _g24_poly(p, c, [(12, 4), (12, 15)], [(7, 10), (12, 15), (17, 10)],
+                                       [(4, 16), (4, 20), (20, 20), (20, 16)]),
     "trash": lambda p, c: _g24_poly(p, c, [(4, 7), (20, 7)], [(9, 7), (9, 4), (15, 4), (15, 7)],
                                     [(6, 7), (7, 20), (17, 20), (18, 7)]),
     "add_profile": lambda p, c: (_g24_dashed_circle(p, c), _g24_poly(p, c, [(12, 8), (12, 16)], [(8, 12), (16, 12)])),
@@ -365,8 +367,8 @@ def icon(name: str, color: str | None = None, size: int = 96) -> QIcon:
         p.setBrush(col)
         p.drawRoundedRect(QRectF(12, 16, 6, 32), 2, 2)
         fill_poly([(50, 16), (50, 48), (24, 32)])
-    elif name[:4] in ("back", "fwd1", "fwd3"):
-        seconds = name[-2:]
+    elif name.startswith(("back", "fwd")):  # back10, fwd30… ; back1m, fwd5m… (minutes, pour les replays)
+        seconds = name[4:] if name.startswith("back") else name[3:]
         p.save()
         if name.startswith("back"):
             p.translate(64, 0)

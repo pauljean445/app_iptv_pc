@@ -1,7 +1,7 @@
 """Pages graphiques : thème aux couleurs du logo, page d'accueil (mosaïques), fiche détaillée en grand."""
 from dataclasses import dataclass
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QPoint, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLayout,
     QListView,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -61,6 +62,15 @@ QToolButton#quickTile:hover {{ border-color: {C['accent_hi']}; background: rgba(
 QPushButton#drawerRow {{ background: transparent; color: {C['text']}; border: none; border-radius: 9px;
     padding: 9px 10px; text-align: left; font-size: 10pt; }}
 QPushButton#drawerRow:hover {{ background: rgba(255, 255, 255, 15); }}
+#cardText {{ color: {C['text']}; font-size: 10pt; }}
+#cardNote {{ color: {C['muted']}; font-size: 8.5pt; }}
+#fieldLabel {{ color: #8C85B8; font-size: 8pt; font-weight: 700; letter-spacing: 1px; }}
+QLineEdit#field {{ background: {C['bg']}; color: {C['text']}; border: 1px solid {C['line']}; border-radius: 9px;
+    padding: 8px 11px; font-size: 10.5pt; selection-background-color: {C['accent']}; }}
+QLineEdit#field:focus {{ border-color: {C['accent']}; }}
+#notice {{ color: {C['muted']}; background: {C['surface']}; border: 1px solid {C['line']}; border-radius: 9px;
+    padding: 8px 11px; font-size: 9.5pt; }}
+#notice[error="true"] {{ color: #FFC2CD; background: rgba(255, 84, 112, 28); border-color: rgba(255, 84, 112, 120); }}
 #kbd {{ color: {C['muted']}; border: 1px solid {C['line']}; background: {C['panel']}; border-radius: 6px;
     padding: 1px 7px; font-size: 8.5pt; }}
 #shortcutGroup {{ color: {C['accent_hi']}; font-size: 8.5pt; font-weight: 700; letter-spacing: 1px; padding-top: 8px; }}
@@ -110,6 +120,10 @@ QPushButton#primary:hover {{ background: {C['accent_hi']}; }}
 QPushButton#secondary {{ background: {C['surface2']}; color: {C['text']}; border: 1px solid {C['line']};
     border-radius: 9px; padding: 10px 18px; font-size: 11pt; }}
 QPushButton#secondary:hover {{ border-color: {C['accent']}; }}
+QPushButton#primary:disabled {{ background: {C['surface2']}; color: {C['muted']}; }}
+QPushButton#danger {{ background: {C['live']}; color: white; border: none; border-radius: 9px;
+    padding: 10px 20px; font-size: 11pt; font-weight: 600; }}
+QPushButton#danger:hover {{ background: #FF7590; }}
 #trackTitle {{ color: {C['muted']}; font-size: 10pt; font-weight: 600; padding-top: 7px; }}
 QPushButton#langChip, QPushButton#subChip {{ background: {C['surface2']}; color: {C['text']};
     border: 1px solid {C['line']}; border-radius: 15px; padding: 6px 14px; font-size: 10pt; }}
@@ -294,6 +308,7 @@ _GRID24 = {
     "trash": lambda p, c: _g24_poly(p, c, [(4, 7), (20, 7)], [(9, 7), (9, 4), (15, 4), (15, 7)],
                                     [(6, 7), (7, 20), (17, 20), (18, 7)]),
     "add_profile": lambda p, c: (_g24_dashed_circle(p, c), _g24_poly(p, c, [(12, 8), (12, 16)], [(8, 12), (16, 12)])),
+    "account": lambda p, c: (_g24_arc(p, c, 12, 8, 4, 0, 360), _g24_arc(p, c, 12, 21, 7.5, 0, 180)),
 }
 
 
@@ -675,6 +690,12 @@ class TileDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index):
         return QSize(self.width + 12, self.img_h + 58)
 
+    @staticmethod
+    def remove_rect(rect) -> QRectF:
+        """Croix « retirer » en haut à droite de l'image (vignette survolée)."""
+        r = QRectF(rect).adjusted(6, 6, -6, -6)
+        return QRectF(r.right() - 31, r.y() + 7, 24, 24)
+
     def paint(self, p: QPainter, option, index):
         tile = index.model().tiles[index.row()]
         r = QRectF(option.rect).adjusted(6, 6, -6, -6)
@@ -713,6 +734,19 @@ class TileDelegate(QStyledItemDelegate):
         if hover:
             p.setPen(QPen(QColor(C["accent_hi"]), 2))
             p.drawPath(path)
+        view = self.parent()
+        if option.state & QStyle.State_MouseOver and getattr(view, "removable", False):
+            badge = self.remove_rect(option.rect)
+            over = badge.contains(getattr(view, "hover_pos", QPointF(-1, -1)))
+            p.setPen(QPen(QColor(C["live"] if over else C["line"]), 1))
+            p.setBrush(QColor(C["live"]) if over else QColor(11, 9, 24, 215))
+            p.drawEllipse(badge)
+            pen = QPen(QColor("white"), 1.8)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            c, d = badge.center(), 4.2
+            p.drawLine(QPointF(c.x() - d, c.y() - d), QPointF(c.x() + d, c.y() + d))
+            p.drawLine(QPointF(c.x() + d, c.y() - d), QPointF(c.x() - d, c.y() + d))
 
         f = QFont(option.font)
         f.setBold(True)
@@ -734,12 +768,17 @@ class TileDelegate(QStyledItemDelegate):
 
 
 class Mosaic(QListView):
-    """Bande horizontale de vignettes (une seule rangée, défilement latéral)."""
+    """Bande horizontale de vignettes (une seule rangée, défilement latéral).
+    remove_label : si donné, chaque vignette peut être retirée (croix au survol, clic droit, touche Suppr)."""
 
     tileClicked = Signal(object)
+    tileRemoved = Signal(object)
 
-    def __init__(self, images, poster: bool):
+    def __init__(self, images, poster: bool, remove_label: str = ""):
         super().__init__()
+        self.remove_label = remove_label
+        self.removable = bool(remove_label)
+        self.hover_pos = QPointF(-1, -1)
         self.setViewMode(QListView.IconMode)
         self.setFlow(QListView.LeftToRight)
         self.setWrapping(False)
@@ -765,11 +804,47 @@ class Mosaic(QListView):
         if index.isValid():
             self.tileClicked.emit(self.tiles.tiles[index.row()].item)
 
+    def _remove(self, index):
+        if index.isValid() and self.removable:
+            self.tileRemoved.emit(self.tiles.tiles[index.row()].item)
+
+    def _on_badge(self, pos) -> QModelIndex | None:
+        """Vignette dont la croix est sous pos (coordonnées de la zone d'affichage), sinon None."""
+        index = self.indexAt(pos)
+        if self.removable and index.isValid() and TileDelegate.remove_rect(self.visualRect(index)).contains(pos):
+            return index
+        return None
+
     def mouseMoveEvent(self, event):
         # Main uniquement au-dessus d'une vignette, pas sur le vide de la bande
         super().mouseMoveEvent(event)
-        on_tile = self.indexAt(event.position().toPoint()).isValid()
-        self.viewport().setCursor(Qt.PointingHandCursor if on_tile else Qt.ArrowCursor)
+        self.hover_pos = event.position()
+        index = self.indexAt(event.position().toPoint())
+        self.viewport().setCursor(Qt.PointingHandCursor if index.isValid() else Qt.ArrowCursor)
+        badge = self._on_badge(event.position().toPoint())
+        self.viewport().setToolTip(self.remove_label if badge is not None else "")
+        if index.isValid():
+            self.viewport().update(self.visualRect(index))  # croix en surbrillance
+
+    def leaveEvent(self, event):
+        self.hover_pos = QPointF(-1, -1)
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        index = self._on_badge(event.position().toPoint()) if event.button() == Qt.LeftButton else None
+        if index is not None:  # clic sur la croix : on retire, sans ouvrir la vignette
+            event.accept()
+            self._remove(index)
+            return
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        index = self.indexAt(event.pos())
+        if not (self.removable and index.isValid()):
+            return
+        menu = QMenu(self)
+        menu.addAction(self.remove_label + "\tSuppr", lambda: self._remove(index))
+        menu.exec(event.globalPos())
 
     def scroll_page(self, direction: int):
         bar = self.horizontalScrollBar()
@@ -788,6 +863,8 @@ class Mosaic(QListView):
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             self._emit(self.currentIndex())
+        elif event.key() == Qt.Key_Delete:
+            self._remove(self.currentIndex())
         else:
             super().keyPressEvent(event)
 
@@ -795,8 +872,9 @@ class Mosaic(QListView):
 class HomeSection(QFrame):
     openTab = Signal(str)
     tileClicked = Signal(str, object)
+    tileRemoved = Signal(str, object)
 
-    def __init__(self, kind: str, title: str, subtitle: str, images, poster: bool):
+    def __init__(self, kind: str, title: str, subtitle: str, images, poster: bool, remove_label: str):
         super().__init__()
         self.kind = kind
         self.setObjectName("section")
@@ -814,8 +892,9 @@ class HomeSection(QFrame):
         head.addWidget(self.title_btn)
         head.addWidget(self.sub)
         head.addStretch(1)
-        self.mosaic = Mosaic(images, poster)
+        self.mosaic = Mosaic(images, poster, remove_label)
         self.mosaic.tileClicked.connect(lambda item: self.tileClicked.emit(self.kind, item))
+        self.mosaic.tileRemoved.connect(lambda item: self.tileRemoved.emit(self.kind, item))
         # Flèches de défilement de la bande (affichées seulement si elle dépasse la largeur)
         self.arrows = []
         for text, direction, tip in (("‹", -1, "Précédents"), ("›", 1, "Suivants")):
@@ -865,12 +944,13 @@ class HomePage(QScrollArea):
 
     openTab = Signal(str)
     tileClicked = Signal(str, object)
+    tileRemoved = Signal(str, object)
 
     SECTIONS = (
-        ("live", "Direct", "Chaînes favorites", False),
-        ("movie", "Films", "En cours de lecture", True),
-        ("series", "Séries", "En cours de lecture", True),
-        ("replay", "Replays", "Chaînes favorites", False),
+        ("live", "Direct", "Chaînes favorites", False, "Retirer des favoris"),
+        ("movie", "Films", "En cours de lecture", True, "Retirer des lectures en cours"),
+        ("series", "Séries", "En cours de lecture", True, "Retirer des lectures en cours"),
+        ("replay", "Replays", "Chaînes favorites", False, "Retirer des favoris"),
     )
 
     def __init__(self, images):
@@ -888,10 +968,11 @@ class HomePage(QScrollArea):
         col.setContentsMargins(16, 12, 16, 16)
         col.setSpacing(12)
         self.sections: dict[str, HomeSection] = {}
-        for kind, title, sub, poster in self.SECTIONS:
-            sec = HomeSection(kind, title, sub, images, poster)
+        for kind, title, sub, poster, remove_label in self.SECTIONS:
+            sec = HomeSection(kind, title, sub, images, poster, remove_label)
             sec.openTab.connect(self.openTab)
             sec.tileClicked.connect(self.tileClicked)
+            sec.tileRemoved.connect(self.tileRemoved)
             self.sections[kind] = sec
             col.addWidget(sec)
         col.addStretch(1)

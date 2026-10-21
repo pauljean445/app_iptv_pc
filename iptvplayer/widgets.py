@@ -351,6 +351,180 @@ class ConnectionDialog(QDialog):
         self.accept()
 
 
+class CardDialog(QDialog):
+    """Fenêtre au style du menu ☰ : panneau arrondi sans barre de titre, avec titre et croix de fermeture.
+    Se déplace en la faisant glisser. Le contenu va dans self.body ; add_buttons() ajoute la rangée du bas."""
+
+    def __init__(self, parent, title: str, width: int = 440):
+        super().__init__(parent, Qt.Dialog | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowTitle(title)
+        self._drag = None
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        panel = QFrame()
+        panel.setObjectName("drawer")
+        outer.addWidget(panel)
+        self.body = QVBoxLayout(panel)
+        self.body.setContentsMargins(20, 14, 16, 20)
+        self.body.setSpacing(14)
+        head = QHBoxLayout()
+        label = QLabel(title)
+        label.setObjectName("drawerTitle")
+        close = QToolButton()
+        close.setObjectName("drawerClose")
+        close.setIcon(ui.icon("close", ui.C["muted"]))
+        close.setIconSize(QSize(18, 18))
+        close.setCursor(Qt.PointingHandCursor)
+        close.setFocusPolicy(Qt.NoFocus)
+        close.clicked.connect(self.reject)
+        head.addWidget(label)
+        head.addStretch(1)
+        head.addWidget(close)
+        self.body.addLayout(head)
+        self.setFixedWidth(width)
+
+    def add_text(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("cardText")
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.RichText)
+        self.body.addWidget(label)
+        return label
+
+    def add_buttons(self, *specs) -> list:
+        """specs : (texte, style, action) ; style = "primary", "secondary" ou "danger". Le dernier est
+        le bouton par défaut (touche Entrée)."""
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addStretch(1)
+        buttons = []
+        for text, style, action in specs:
+            b = QPushButton(text)
+            b.setObjectName(style)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(action)
+            row.addWidget(b)
+            buttons.append(b)
+        buttons[-1].setDefault(True)
+        self.body.addSpacing(4)
+        self.body.addLayout(row)
+        return buttons
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event):
+        if self._drag is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag)
+
+    def mouseReleaseEvent(self, event):
+        self._drag = None
+
+
+def confirm(parent, title: str, text: str, ok: str, danger: bool = False) -> bool:
+    """Question oui / non au style du menu ☰ (à la place de QMessageBox.question)."""
+    dlg = CardDialog(parent, title)
+    dlg.add_text(text)
+    dlg.add_buttons(("Annuler", "secondary", dlg.reject), (ok, "danger" if danger else "primary", dlg.accept))
+    return dlg.exec() == QDialog.Accepted
+
+
+class AccountDialog(CardDialog):
+    """Compte du foyer : connexion (email, mot de passe) ou, si ce PC est connecté, déconnexion.
+
+    sign_in(email, password, on_ok, on_error) est fourni par la fenêtre principale (appel réseau en
+    arrière-plan) ; sign_out() déconnecte ce PC. Le compte est obligatoire : sans connexion, on quitte.
+    """
+
+    def __init__(self, parent, email: str, signed_in: bool, sign_in, sign_out, notice: str = ""):
+        super().__init__(parent, "Compte du foyer")
+        self._sign_in, self._sign_out = sign_in, sign_out
+        if signed_in:
+            box = QFrame()
+            box.setObjectName("drawerGroup")
+            row = QHBoxLayout(box)
+            row.setContentsMargins(12, 10, 12, 10)
+            row.setSpacing(12)
+            icon = QLabel()
+            icon.setPixmap(ui.icon("account", ui.C["accent_hi"]).pixmap(QSize(22, 22), self.devicePixelRatioF()))
+            who = QLabel(f"<span style='color:{ui.C['muted']}'>Connecté au compte</span><br><b>{email}</b>")
+            who.setObjectName("cardText")
+            row.addWidget(icon)
+            row.addWidget(who, 1)
+            self.body.addWidget(box)
+            self.add_text("Les profils, favoris, reprises de lecture et choix de langue sont partagés avec les "
+                          "autres appareils du foyer.")
+            self.add_buttons(("Se déconnecter", "secondary", self._on_sign_out), ("Fermer", "primary", self.reject))
+            return
+        self.add_text("Connecte-toi au compte de ton foyer pour utiliser l'appli. Les profils, favoris, reprises "
+                      "de lecture et choix de langue sont partagés avec la TV et les autres PC.")
+        self.email = self._field("EMAIL", email, "adresse email du compte")
+        self.password = self._field("MOT DE PASSE", "", "")
+        self.password.setEchoMode(QLineEdit.Password)
+        self.status = QLabel()
+        self.status.setObjectName("notice")
+        self.status.setWordWrap(True)
+        self.status.setVisible(False)
+        self.body.addWidget(self.status)
+        note = QLabel("Le mot de passe n'est pas enregistré : ce PC garde seulement une session, chiffrée par "
+                      "Windows.")
+        note.setObjectName("cardNote")
+        note.setWordWrap(True)
+        self.body.addWidget(note)
+        _, self.ok = self.add_buttons(("Quitter", "secondary", self.reject),
+                                      ("Se connecter", "primary", self._on_sign_in))
+        (self.password if email else self.email).setFocus()
+        if notice:
+            self._show(notice, error=True)
+
+    def _field(self, label: str, value: str, placeholder: str) -> QLineEdit:
+        box = QVBoxLayout()
+        box.setSpacing(6)
+        head = QLabel(label)
+        head.setObjectName("fieldLabel")
+        edit = QLineEdit(value)
+        edit.setObjectName("field")
+        edit.setPlaceholderText(placeholder)
+        box.addWidget(head)
+        box.addWidget(edit)
+        self.body.addLayout(box)
+        return edit
+
+    def _on_sign_in(self):
+        email, password = self.email.text().strip(), self.password.text()
+        if not email or not password:
+            self._show("Merci de saisir l'email et le mot de passe.", error=True)
+            return
+        self.ok.setEnabled(False)
+        self.ok.setText("Connexion…")
+        self.status.setVisible(False)
+
+        def failed(msg):
+            self.ok.setEnabled(True)
+            self.ok.setText("Se connecter")
+            self._show(f"Connexion impossible : {msg}.", error=True)
+            self.password.selectAll()
+            self.password.setFocus()
+
+        self._sign_in(email, password, self.accept, failed)
+
+    def _on_sign_out(self):
+        if confirm(self, "Se déconnecter",
+                   "Déconnecter ce PC du compte du foyer ? Il faudra se reconnecter pour continuer à utiliser "
+                   "l'appli. Les données présentes sur ce PC sont conservées.", "Se déconnecter", danger=True):
+            self._sign_out()
+            self.accept()
+
+    def _show(self, text: str, error: bool = False):
+        self.status.setText(text)
+        self.status.setProperty("error", error)
+        self.status.style().unpolish(self.status)
+        self.status.style().polish(self.status)
+        self.status.setVisible(True)
+
+
 # --------------------------------------------------------------------------- #
 # Barre de contrôle flottante (plein écran)
 # --------------------------------------------------------------------------- #
@@ -586,18 +760,18 @@ class ShortcutsDialog(QDialog):
 
 
 class ManageProfilesDialog(QDialog):
-    """Gérer les profils : modifier, changer la source IPTV, supprimer ; « Qui regarde ? » au démarrage.
+    """Gérer les profils : modifier, changer la source IPTV, réinitialiser, supprimer ; « Qui regarde ? ».
 
-    Les actions sont fournies par la fenêtre principale : on_edit(pid), on_source(pid), on_delete(pid)
-    (qui retournent True si la liste doit être redessinée), on_ask(bool).
+    Les actions sont fournies par la fenêtre principale : on_edit(pid), on_source(pid), on_reset(pid),
+    on_delete(pid) (qui retournent True si la liste doit être redessinée), on_ask(bool).
     """
 
-    def __init__(self, parent, cfg, current, on_edit, on_source, on_delete, on_ask):
+    def __init__(self, parent, cfg, current, on_edit, on_source, on_reset, on_delete, on_ask):
         super().__init__(parent)
         self.setWindowTitle("Gérer les profils")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(640)
         self.cfg, self.current = cfg, current
-        self.actions = on_edit, on_source, on_delete
+        self.actions = on_edit, on_source, on_reset, on_delete
         lay = QVBoxLayout(self)
         lay.setContentsMargins(20, 18, 20, 18)
         lay.setSpacing(14)
@@ -631,8 +805,8 @@ class ManageProfilesDialog(QDialog):
             name = QLabel(prof["name"] + ("  ·  en cours" if prof["id"] == self.current else ""))
             h.addWidget(av)
             h.addWidget(name, 1)
-            for (label, icon), action in zip((("Modifier", "edit"), ("Source IPTV", "plug"), ("Supprimer", "trash")),
-                                             self.actions):
+            for (label, icon), action in zip((("Modifier", "edit"), ("Source IPTV", "plug"),
+                                              ("Réinitialiser", "reload"), ("Supprimer", "trash")), self.actions):
                 if label == "Supprimer" and single:
                     continue
                 b = QPushButton(label)

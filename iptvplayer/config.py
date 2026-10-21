@@ -1,13 +1,16 @@
 """Sauvegarde / chargement des réglages de l'application (fichiers JSON), profils compris.
 
 Réglages communs : settings.json (volume, fenêtre, clé OMDb…, liste des profils).
-Chaque profil a son dossier profiles/<id>/ : profile.json (source IPTV, dernière lecture, langues…),
-library.json (favoris, reprises, « Vu récemment ») et catalog.bin (catalogue de sa source).
+Chaque profil a son dossier profiles/<id>/ : profile.json (réglages propres à cet appareil : source IPTV,
+dernière lecture…), library.json (favoris, reprises, « Vu récemment », langues : à synchroniser entre
+appareils) et catalog.bin (catalogue de sa source).
 """
 import json
 import os
+import secrets
 import shutil
 import sys
+import time
 from pathlib import Path
 
 DEFAULTS = {
@@ -29,9 +32,9 @@ DEFAULTS = {
     "ask_profile": True,       # « Qui regarde ? » au démarrage quand il y a plusieurs profils
 }
 
-# Réglages propres à chaque profil ; tous les autres sont communs
+# Réglages propres à chaque profil sur cet appareil ; tous les autres sont communs
 PROFILE_KEYS = ("mode", "server", "username", "password", "stream_format", "url", "file", "remember",
-                "last_key", "last_tab", "series_keywords", "track_prefs", "cast_compat")
+                "last_key", "last_tab", "series_keywords", "cast_compat")
 SOURCE_KEYS = ("mode", "server", "username", "password", "stream_format", "url", "file", "remember")
 PROFILE_COLORS = ("#7B66FF", "#FF5470", "#2EC4B6", "#FFB020", "#3A86FF", "#8AC926")
 PROFILE_FILES = ("library.json", "catalog.bin")  # données d'un profil (avant les profils : à la racine)
@@ -46,6 +49,8 @@ def asset_path(name: str) -> str:
 
 
 def config_dir() -> Path:
+    if os.environ.get("IPTVPLAYER_DATA"):  # dossier de données à part (essais depuis les sources : run_dev.bat)
+        return Path(os.environ["IPTVPLAYER_DATA"])
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA", str(Path.home())))
     elif sys.platform == "darwin":
@@ -114,9 +119,23 @@ def _migrate(data: dict) -> dict:
     return data
 
 
+def _move_track_prefs(data: dict) -> None:
+    """Langues choisies : de profile.json (propre à l'appareil) vers library.json (synchronisé avec le profil)."""
+    for prof in data["profiles"]:
+        folder = profile_dir(prof["id"])
+        own = _read(folder / "profile.json")
+        if "track_prefs" not in own:
+            continue
+        lib = _read(folder / "library.json")
+        lib["track_prefs"] = {**own.pop("track_prefs"), **(lib.get("track_prefs") or {})}
+        _write(folder / "library.json", lib)
+        _write(folder / "profile.json", own, indent=2)
+
+
 def load() -> dict:
     """Réglages communs + ceux du profil en cours (le dernier utilisé si aucun n'est choisi)."""
     data = _migrate(_read(config_path()))
+    _move_track_prefs(data)
     ids = [p["id"] for p in data["profiles"]]
     if _profile not in ids:
         set_profile(data.get("profile") if data.get("profile") in ids else ids[0])
@@ -151,11 +170,15 @@ def save_common(cfg: dict, pid: str) -> None:
 # ---- Gestion des profils ------------------------------------------------- #
 def create_profile(cfg: dict, name: str, color: str, copy_source_from: dict | None = None) -> str:
     """Ajoute un profil (sa source IPTV copiée depuis copy_source_from, sinon vide). Retourne son id."""
-    used = {p["id"] for p in cfg["profiles"]}
-    n = 1
-    while f"p{n}" in used:
-        n += 1
-    pid = f"p{n}"
+    pid = "p" + secrets.token_hex(4)  # unique aussi entre les appareils d'un même compte (synchronisation)
+    init_profile_folder(pid, copy_source_from)
+    cfg["profiles"].append({"id": pid, "name": name, "color": color, "t": time.time()})
+    return pid
+
+
+def init_profile_folder(pid: str, copy_source_from: dict | None = None) -> None:
+    """Dossier d'un profil sur ce PC, avec la source IPTV (et le catalogue) de copy_source_from s'il est donné
+    (réglages d'un autre profil, « profile » = son id)."""
     folder = profile_dir(pid)
     folder.mkdir(parents=True, exist_ok=True)
     own = {}
@@ -171,8 +194,6 @@ def create_profile(cfg: dict, name: str, color: str, copy_source_from: dict | No
             except OSError:
                 pass
     _write(folder / "profile.json", own, indent=2)
-    cfg["profiles"].append({"id": pid, "name": name, "color": color})
-    return pid
 
 
 def read_profile(pid: str) -> dict:
@@ -188,7 +209,9 @@ def write_profile(pid: str, data: dict) -> None:
 
 
 def delete_profile(cfg: dict, pid: str) -> None:
+    """Supprime un profil ; la trace datée (profiles_deleted) le fait disparaître des autres appareils."""
     cfg["profiles"] = [p for p in cfg["profiles"] if p["id"] != pid]
+    cfg.setdefault("profiles_deleted", {})[pid] = time.time()
     shutil.rmtree(profile_dir(pid), ignore_errors=True)
 
 

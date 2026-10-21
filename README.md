@@ -8,6 +8,7 @@ Python + PySide6 (interface) + libVLC (lecture des flux).
 iptv_player/
 ├─ main.py                 lanceur (python main.py)
 ├─ run_windows.bat         lancer depuis les sources (Windows)
+├─ run_dev.bat             idem, sur une copie des données (%LOCALAPPDATA%\IPTVPlayer-dev)
 ├─ build_windows.bat       créer l'application dans dist\IPTVPlayer
 ├─ build_installer.bat     créer l'installeur dist\IPTVPlayer-Setup-<version>.exe (appli + VLC)
 ├─ installer/              IPTVPlayer.iss (script Inno Setup de l'installeur)
@@ -22,6 +23,8 @@ iptv_player/
 │  ├─ power.py             pas de mise en veille du PC pendant une lecture / une diffusion
 │  ├─ update.py            mise à jour depuis l'appli (releases GitHub)
 │  ├─ library.py           favoris, reprises de lecture, « Vu récemment »
+│  ├─ cloud.py             compte du foyer (Firebase) : connexion, accès à la base Firestore
+│  ├─ sync.py              synchro des profils et de leurs données avec le compte du foyer
 │  ├─ images.py            affiches et logos (téléchargement, cache)
 │  ├─ config.py            réglages et fichiers de données
 │  └─ sources/             catalogue : playlist.py (M3U), xtream.py (API Xtream),
@@ -44,6 +47,8 @@ iptv_player/
   pip install -r requirements.txt
   python main.py
   ```
+
+Pour essayer une version en cours sans risquer les données de l'appli installée : `run_dev.bat` (copie réglages et profils dans `%LOCALAPPDATA%\IPTVPlayer-dev` au premier lancement ; supprimer ce dossier pour repartir des données actuelles). Le dossier de données peut aussi être choisi avec la variable d'environnement `IPTVPLAYER_DATA`.
 
 ## Créer l'exécutable (recommandé : démarrage le plus rapide, ~63 Mo)
 - Windows : `build_windows.bat` → dossier `dist\IPTVPlayer\` (lancer `IPTVPlayer.exe`)
@@ -89,11 +94,23 @@ Au premier lancement, la fenêtre **Connexion IPTV** s'ouvre (☰ > Connexion IP
 
 En **Xtream Codes** (ou avec une URL `get.php?username=…&password=…`), l'appli utilise l'API du fournisseur (`player_api.php`) : les catégories Direct / Films / Séries sont celles du fournisseur, sans devinette. Si l'API ne répond pas, elle se rabat sur la playlist M3U.
 
-**Profils** : bouton du profil (pastille et nom) en haut à droite, à côté de ☰. Chaque profil a sa propre source IPTV, ses favoris, ses lectures en cours, son « Vu récemment » et ses choix de langue ; le volume, la taille de la fenêtre et la clé OMDb sont communs. « Nouveau profil… » propose la même IPTV que le profil en cours (catalogue repris, rien à retélécharger) ou une autre (identifiants demandés à l'ouverture du profil). Avec plusieurs profils, l'appli demande « Qui regarde ? » au démarrage (désactivable dans le menu du profil). Données : `%APPDATA%\IPTVPlayer\profiles\<id>\` (`profile.json`, `library.json`, `catalog.bin`) ; les données d'avant les profils deviennent le profil « Principal ».
+**Profils** : bouton du profil (pastille et nom) en haut à droite, à côté de ☰. Chaque profil a sa propre source IPTV, ses favoris, ses lectures en cours, son « Vu récemment » et ses choix de langue ; le volume, la taille de la fenêtre et la clé OMDb sont communs. « Nouveau profil… » propose la même IPTV que le profil en cours (catalogue repris, rien à retélécharger) ou une autre (identifiants demandés à l'ouverture du profil). Avec plusieurs profils, l'appli demande « Qui regarde ? » au démarrage (désactivable dans le menu du profil). *Gérer les profils > Réinitialiser* efface les favoris, lectures en cours, « Vu récemment », épisodes vus et choix de langue d'un profil (à faire après un changement de fournisseur IPTV) ; le profil et sa source sont gardés. Données : `%APPDATA%\IPTVPlayer\profiles\<id>\` (`profile.json`, `library.json`, `catalog.bin`) ; les données d'avant les profils deviennent le profil « Principal ».
+
+**Compte du foyer** : obligatoire. Au premier lancement (ou après *☰ > Compte du foyer > Se déconnecter*), l'appli demande l'email et le mot de passe du compte Firebase du foyer, et se ferme sans connexion. Une fois connecté, elle démarre ensuite directement, même si le serveur est momentanément injoignable. Le compte sert à partager profils, favoris, reprises et langues avec la TV et les autres PC. Les comptes sont créés par l'administrateur dans la console Firebase (*Authentication > Users*), les inscriptions depuis l'appli sont fermées, et les règles Firestore n'autorisent que les UID listés, chacun dans `households/<uid>`. Seule la clé publique du projet est dans le code (`cloud.py`) ; ne jamais y mettre de clé de compte de service. Le mot de passe n'est pas enregistré : `account.json` garde l'email, l'UID et le jeton de session, chiffré par Windows (DPAPI).
+
+**Synchronisation** : la liste des profils (nom, couleur) et, pour chaque profil, favoris (et leur ordre), lectures en cours, « Vu récemment », épisodes vus et choix de langue sont partagés entre tous les appareils du foyer. La source IPTV, la dernière chaîne et les réglages de l'appareil restent propres à chaque appareil (un profil arrivé d'un autre appareil reprend la source IPTV du profil en cours : même abonnement dans un foyer).
+- Quand : au lancement (liste des profils, avant « Qui regarde ? »), toutes les 30 s (liste des profils toutes les 2 min, aussitôt après un changement de profils), au changement de profil et à la fermeture.
+- Règle : pour chaque entrée, la modification la plus récente gagne, ajout comme suppression (un favori retiré sur la TV l'est aussi sur le PC). Même film sur le même profil sur deux écrans : la dernière position enregistrée l'emporte.
+- Serveur injoignable : l'appli fonctionne normalement avec ses données et rattrape au passage suivant.
+- PC jamais synchronisé (données d'avant la synchro) : si le foyer n'a encore aucun profil, ceux du PC sont envoyés avec leurs données ; sinon le PC prend les profils du foyer (les siens sont laissés de côté).
+- Changement de compte sur un PC : il prend les profils du nouveau foyer, ou un profil « Principal » neuf si ce foyer est vide (même source IPTV). Rien de l'ancien foyer n'est envoyé dans le nouveau ; ses données restent sur son compte et reviennent si l'on s'y reconnecte.
+- Un profil supprimé sur un appareil disparaît des autres, avec ses données sur le serveur.
+- Base Firestore : `households/<uid>` (liste des profils) et `households/<uid>/profiles/<id>` (données du profil, même forme que `library.json`). Chaque passage lit 1 à 2 documents et n'écrit que les champs plus récents sur ce PC.
 
 L'appli s'ouvre sur l'**accueil** (onglet Accueil, `Ctrl+H`) : quatre bandes horizontales (flèches ‹ ›, Maj+molette ou pavé tactile pour les faire défiler ; la page défile si l'écran est trop petit).
 - **Direct** et **Replays** : tes chaînes favorites. Un clic lance la chaîne (Direct) ou ouvre ses programmes (Replays).
 - **Films** et **Séries** : ce que tu as commencé, avec la progression. Un clic reprend la lecture (pour une série, l'épisode en cours ou le suivant).
+- Pour retirer une vignette : la croix en haut à droite (au survol), clic droit ou touche Suppr. Une chaîne quitte les favoris, un film ou une série les lectures en cours (position de reprise comprise).
 - Un clic sur le titre d'un bloc ouvre l'onglet correspondant. Pendant une lecture, le bouton « En lecture » du bandeau y ramène.
 
 Quatre onglets :
@@ -114,7 +131,7 @@ Films, épisodes et replays ont une barre de progression (clic pour se déplacer
 
 **Replays : déplacement à la minute.** Le serveur découpe les enregistrements en blocs d'une minute et renvoie toujours le début d'un bloc, même quand on lui demande un endroit précis du fichier (vérifié octet par octet). VLC, qui ne connaît pas la durée d'un replay, ignore en plus les demandes « aller à telle heure ». L'appli demande donc au serveur le replay qui commence à la minute voulue : les boutons et `←` / `→` avancent / reculent d'une minute, les grands boutons de 5 minutes, et un clic sur la barre va à la minute la plus proche. Les clics rapprochés sont regroupés en un seul déplacement. Une relance (passage sur la télé, reconnexion) reprend au début de la minute en cours.
 
-**Langues et sous-titres** : la fiche d'un film, d'une série ou d'un épisode liste les langues et sous-titres du fichier (lus en 1 à 4 s). Un bouton de langue lance la lecture dans cette langue (pour une série : l'épisode que « Lire » lancerait, le premier si elle n'est pas commencée) ; les sous-titres se choisissent avant. Le choix, fait sur la fiche ou pendant la lecture, est mémorisé par film et par série (`track_prefs` dans `settings.json`) et appliqué aux épisodes suivants, même quand l'ordre des pistes change d'un fichier à l'autre.
+**Langues et sous-titres** : la fiche d'un film, d'une série ou d'un épisode liste les langues et sous-titres du fichier (lus en 1 à 4 s). Un bouton de langue lance la lecture dans cette langue (pour une série : l'épisode que « Lire » lancerait, le premier si elle n'est pas commencée) ; les sous-titres se choisissent avant. Le choix, fait sur la fiche ou pendant la lecture, est mémorisé par film et par série (`prefs` dans le `library.json` du profil) et appliqué aux épisodes suivants, même quand l'ordre des pistes change d'un fichier à l'autre.
 
 **Enchaînement automatique** : à la fin d'un épisode, l'épisode suivant démarre aussitôt (saison suivante comprise) ; à la fin d'un replay, le programme suivant de la même chaîne (utile quand une émission déborde sur le créneau d'après). Fonctionne aussi en diffusion sur la télé. `N` ou le bouton « Épisode suivant » / « Programme suivant » lance la suite avant la fin.
 
@@ -156,7 +173,9 @@ Si le flux se coupe, l'appli tente de se reconnecter automatiquement (5 essais) 
 Fichier `settings.json` dans `%APPDATA%\IPTVPlayer` (Windows) ou `~/.config/IPTVPlayer` (Linux).
 - `network_cache_ms` (défaut 1500) : augmente-le (3000, 5000) si la lecture saccade.
 - Les identifiants y sont stockés **en clair** si « Mémoriser la connexion » est coché. Décoche la case pour ne rien enregistrer.
-- `library.json` : favoris, positions de lecture et « Vu récemment ». `meta_cache.json` : notes IMDb.
+- `profiles\<id>\profile.json` : réglages du profil propres à cet appareil (source IPTV, dernière lecture).
+- `profiles\<id>\library.json` : favoris, positions de lecture, « Vu récemment », épisodes vus et langues choisies (données prévues pour la synchronisation entre appareils). Chaque entrée porte l'heure de sa dernière modification et chaque suppression laisse une trace datée (`deleted`), effacée après 3 mois ; les lectures en cours ne sont jamais purgées.
+- `meta_cache.json` : notes IMDb.
 - `catalog.bin` (~1,5 Mo) : copie du catalogue Xtream, affichée instantanément au lancement puis actualisée en arrière-plan (sans identifiants ; supprimable sans risque).
 - `images\` : affiches (petite taille) et logos en cache, plafonné à 150 Mo (les plus anciennes sont supprimées automatiquement).
 

@@ -78,17 +78,19 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from . import cast, library, power, ui, update, vlc_loader
+from . import cast, cloud, library, power, sync, ui, update, vlc_loader
 from . import tracks as tracklib
 from .images import ImageLoader
 from .sources import catalog, omdb, playlist, xtream
-from .widgets import (ConnectionDialog, ControlsOverlay, GroupCombo, ItemList, ItemModel, ManageProfilesDialog,
-                      ProfileDialog, ProfilePicker, SeekSlider, ShortcutsDialog, SideMenu, VideoFrame)
+from .widgets import (AccountDialog, ConnectionDialog, ControlsOverlay, GroupCombo, ItemList, ItemModel, ManageProfilesDialog,
+                      ProfileDialog, ProfilePicker, SeekSlider, ShortcutsDialog, SideMenu, VideoFrame, confirm)
 
 
 vlc, VLC_ERROR = vlc_loader.load()
 
 MAX_RETRIES = 5
+SYNC_MS = 30_000        # synchro avec le compte du foyer : toutes les 30 s…
+SYNC_ROOT_EVERY = 4     # … et la liste des profils un passage sur 4 (2 min)
 TABS = [("live", "Direct"), ("movie", "Films"), ("series", "Séries"), ("replay", "Replays")]
 TAB_ICONS = {"live": "live", "movie": "film", "series": "series", "replay": "replay"}
 TAB_COUNT = {"live": "chaînes", "movie": "films", "series": "séries", "replay": "chaînes en replay"}
@@ -162,6 +164,28 @@ def _emit(callback, value):
         pass
 
 
+def ask_account(parent=None, notice: str = "") -> bool:
+    """Connexion au compte du foyer, obligatoire pour utiliser l'appli ; False si l'utilisateur quitte."""
+    session = cloud.session()
+
+    def sign_in(email, password, on_ok, on_error):
+        run_async(lambda: session.sign_in(email, password), lambda _=None: on_ok(), on_error)
+
+    dlg = AccountDialog(parent, session.email, False, sign_in, session.sign_out, notice)
+    return dlg.exec() == QDialog.Accepted and session.signed_in
+
+
+def cloud_task(fn):
+    """fn pour run_async : une erreur du serveur est retournée (et non levée) pour garder son type."""
+    def run():
+        try:
+            return fn()
+        except cloud.CloudError as e:
+            print(f"Synchro : {e.__class__.__name__} : {e}")
+            return e
+    return run
+
+
 def run_async(fn, on_done, on_error=None):
     """Exécute fn() dans un thread et appelle on_done(résultat) / on_error(message) dans l'interface."""
     def work():
@@ -227,6 +251,7 @@ class MainWindow(QMainWindow):
         self.profile_folder = config.profile_dir(self.profile_id)
         self._switched = False  # fenêtre fermée pour passer à un autre profil
         self.library = library.Library(self.profile_folder)
+        self.cloud = cloud.session()  # compte du foyer (commun à tous les profils de ce PC)
         self.images = ImageLoader(self)
         self.client: xtream.XtreamClient | None = None
         self.by_tab: dict[str, list[playlist.Item]] = {k: [] for k, _ in TABS}
@@ -267,7 +292,7 @@ class MainWindow(QMainWindow):
         self._paused_at = None            # direct : début de la pause en cours (time.monotonic)
         self._auto_next = None            # épisode / programme lancé automatiquement à la fin du précédent
         # Langue / sous-titres choisis par film ou par série : {clé: {"audio": {lang, desc}, "spu": … | "off"}}
-        self.track_prefs: dict = self.cfg.setdefault("track_prefs", {})
+        self.track_prefs: dict = self.library.prefs  # lecture seule : on les change par library.set_pref
         self._track_cache: dict = {}      # pistes lues dans chaque fichier (url -> [tracks.Track])
         self._probe_waiters: dict = {}    # lectures de pistes en cours (url -> fonctions à rappeler)
         self._play_token = None           # lecture en attente de la lecture des pistes
@@ -328,6 +353,14 @@ class MainWindow(QMainWindow):
         self.tracks_timer.setSingleShot(True)
         self.tracks_timer.setInterval(450)
         self.tracks_timer.timeout.connect(self._probe_details)
+
+        # Synchro avec le compte du foyer (profils, favoris, reprises, langues)
+        self.sync_timer = QTimer(self)
+        self.sync_timer.setInterval(SYNC_MS)
+        self.sync_timer.timeout.connect(self._sync)
+        self._sync_busy = False
+        self._sync_round = 0              # passage n° 0, 4, 8… : liste des profils comprise
+        self._sync_error_shown = False
 
         # Plein écran : la barre de contrôle apparaît quand la souris bouge, disparaît après 3 s
         self.fs_timer = QTimer(self)
@@ -692,6 +725,7 @@ class MainWindow(QMainWindow):
         self.home = ui.HomePage(self.images)
         self.home.openTab.connect(self.show_browse)
         self.home.tileClicked.connect(self._on_tile)
+        self.home.tileRemoved.connect(self._on_tile_removed)
         self.pages = QStackedWidget()
         self.pages.addWidget(self.home)
         self.pages.addWidget(self.browse)
@@ -818,8 +852,10 @@ class MainWindow(QMainWindow):
             if d.exec() != QDialog.Accepted:
                 return False
             prof["name"], prof["color"], _ = d.values()
+            prof["t"] = time.time()
             config.save(self.cfg, self.profile_id)
             self._update_profile_btn()
+            self._sync_soon()
             return True
 
         def source(pid):
@@ -850,13 +886,34 @@ class MainWindow(QMainWindow):
             config.delete_profile(self.cfg, pid)
             config.save(self.cfg, self.profile_id)
             self._update_profile_btn()
+            self._sync_soon()
             return True
+
+        def reset(pid):
+            prof = next(p for p in self.cfg["profiles"] if p["id"] == pid)
+            if not confirm(
+                    dlg, "Réinitialiser le profil",
+                    f"Effacer les favoris, lectures en cours, « Vu récemment », épisodes vus et choix de langue du "
+                    f"profil <b>{prof['name']}</b> ? À faire après un changement de fournisseur IPTV, quand ces "
+                    "données ne correspondent plus au catalogue. Le profil et sa source IPTV sont conservés.",
+                    "Réinitialiser", danger=True):
+                return False
+            if pid != self.profile_id:
+                lib = library.Library(config.profile_dir(pid))
+                lib.reset()
+                session = self.cloud
+                run_async(cloud_task(lambda: sync.sync_library_now(session, lib, pid)), lambda _: None)
+                return False
+            self.library.reset()
+            self._library_changed()
+            self._sync_soon()
+            return False
 
         def ask(on):
             self.cfg["ask_profile"] = on
             config.save(self.cfg, self.profile_id)
 
-        dlg = ManageProfilesDialog(self, self.cfg, self.profile_id, edit, source, delete, ask)
+        dlg = ManageProfilesDialog(self, self.cfg, self.profile_id, edit, source, reset, delete, ask)
         dlg.exec()
 
     def new_profile(self):
@@ -870,24 +927,31 @@ class MainWindow(QMainWindow):
         pid = config.create_profile(self.cfg, name, color, self.cfg if same else None)
         self.switch_profile(pid)
 
-    def switch_profile(self, pid: str, delete_current: bool = False):
-        """Change de profil : tout est enregistré, puis la fenêtre est rouverte sur l'autre profil."""
+    def switch_profile(self, pid: str, delete_current: bool = False, save: bool = True, message: str = ""):
+        """Change de profil : tout est enregistré, puis la fenêtre est rouverte sur l'autre profil.
+        save=False : rien n'est enregistré (réglages déjà à jour sur le disque, ou profil supprimé ailleurs) ;
+        la fenêtre est rouverte même sur le même profil."""
         global _main_window
-        if pid == self.profile_id and not delete_current:
+        if pid == self.profile_id and not delete_current and save:
             return
         self.stop()
-        self._save_progress()
-        self.cfg["window_geometry"] = bytes(self.saveGeometry().toHex()).decode()
+        if save:
+            self._save_progress()
+            self.cfg["window_geometry"] = bytes(self.saveGeometry().toHex()).decode()
         if delete_current:
             config.delete_profile(self.cfg, self.profile_id)
             config.save_common(self.cfg, pid)
-        else:
+        elif save:
             self.library.save()
             config.save(self.cfg, self.profile_id)
+            self._sync_now()
         self._switched = True  # la fermeture n'enregistre plus rien (déjà fait)
+        self.sync_timer.stop()
         config.set_profile(pid)
         win = MainWindow()
         win.showMaximized()
+        if message:
+            win.statusBar().showMessage(message, 10000)
         _main_window = win
         self.close()
 
@@ -983,6 +1047,19 @@ class MainWindow(QMainWindow):
         elif kind == "series":
             self.open_series(it, play_resume=self._series_resume_target(it) is not None or it.episodes is None)
 
+    def _on_tile_removed(self, kind: str, it):
+        """Croix d'une vignette de l'accueil : la chaîne quitte les favoris, le film / la série les lectures
+        en cours (position de reprise comprise, comme « Retirer de « Vu récemment » »)."""
+        if kind in ("live", "replay"):
+            if self.library.is_favorite(kind, it.key):
+                self.library.toggle_favorite(kind, it.key)
+            msg = f"{it.name} : retiré des favoris"
+        else:
+            self.library.remove_recent(it.key, [e.key for e in (it.episodes or [])])
+            msg = f"{it.name} : retiré des lectures en cours"
+        self._library_changed()
+        self.statusBar().showMessage(msg, 4000)
+
     def _update_right(self):
         """Partie droite : la vidéo pendant une lecture, sinon la fiche de l'élément sélectionné."""
         it = self.details_item
@@ -1042,7 +1119,8 @@ class MainWindow(QMainWindow):
             self,
             [("plug", "Connexion IPTV", self.open_connection), ("reload", "Recharger", self.reload_playlist),
              ("fullscreen", "Plein écran", self.toggle_fullscreen)],
-            [[("star", "Notes IMDb (clé OMDb)", "", self.set_omdb_key),
+            [[("account", "Compte du foyer", "", self.open_account),
+              ("star", "Notes IMDb (clé OMDb)", "", self.set_omdb_key),
               ("keyboard", "Raccourcis clavier", "?", self.show_shortcuts),
               ("download", "Mise à jour", f"v{__version__}", lambda: self.check_update(silent=False))],
              [("quit", "Quitter", "Ctrl+Q", self.close)]])
@@ -1127,6 +1205,8 @@ class MainWindow(QMainWindow):
             self._load(src, use_cache=True)  # lecture du cache et…
         self._build_vlc_async()              # … initialisation de VLC, chacune dans un thread
         QTimer.singleShot(2500, self._scan_cast)  # appareils de diffusion prêts avant le 1er clic
+        QTimer.singleShot(1500, self._sync)       # ce que les autres appareils ont changé depuis
+        self.sync_timer.start()
         if update.supported():
             QTimer.singleShot(8000, lambda: self.check_update(silent=True))
         if not src:
@@ -1268,6 +1348,144 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Échec du chargement")
         QMessageBox.critical(self, "Erreur de chargement", message)
         self.open_connection()
+
+    def open_account(self):
+        """Compte du foyer : après une déconnexion, l'appli ne continue qu'avec une nouvelle connexion."""
+        def sign_out():
+            self._sync_now()  # dernières modifications envoyées au compte que l'on quitte
+            self.cloud.sign_out()
+
+        dlg = AccountDialog(self, self.cloud.email, True, None, sign_out)
+        if dlg.exec() != QDialog.Accepted or self.cloud.signed_in:
+            return
+        self.stop()
+        if ask_account(self):
+            self._after_login()
+        else:
+            self.close()
+
+    def _after_login(self):
+        """Nouvelle connexion (peut-être à un autre compte) : profils du foyer, puis fenêtre rouverte."""
+        self._save_progress()
+        self.library.save()
+        config.save(self.cfg, self.profile_id)
+        try:
+            sync.startup(self.cloud)
+        except cloud.AuthError as e:
+            self._session_lost(str(e))
+            return
+        self.switch_profile(config.current_profile(), save=False,
+                            message=f"Connecté au compte {self.cloud.email}")
+
+    def _session_lost(self, reason: str):
+        """Session refusée par le serveur (mot de passe changé, compte désactivé ou retiré) : reconnexion."""
+        self.sync_timer.stop()
+        self.cloud.sign_out()
+        self.stop()
+        if ask_account(self, f"Reconnexion nécessaire : {reason}."):
+            self._after_login()
+        else:
+            self.close()
+
+    # ---- Synchro avec le compte du foyer ----------------------------------- #
+    def _sync(self):
+        """Un passage : lecture du serveur (thread), fusion ici, puis envoi de ce qui est plus récent ici."""
+        if self._sync_busy or self._switched or not self.cloud.signed_in:
+            return
+        self._sync_busy = True
+        with_root = self._sync_round % SYNC_ROOT_EVERY == 0
+        self._sync_round += 1
+        session, pid = self.cloud, self.profile_id
+
+        def fetch():
+            root = session.get_doc("") if with_root else None
+            return with_root, root, session.get_doc(f"profiles/{pid}")
+
+        run_async(cloud_task(fetch), self._sync_merge)
+
+    def _sync_soon(self):
+        """Synchro complète (liste des profils comprise) dans un instant : après un changement de profils."""
+        self._sync_round -= self._sync_round % SYNC_ROOT_EVERY
+        QTimer.singleShot(500, self._sync)
+
+    def _sync_merge(self, result):
+        if isinstance(result, cloud.CloudError):
+            self._sync_failed(result)
+            return
+        if self._switched:
+            self._sync_busy = False
+            return
+        with_root, root, doc = result
+        writes = self._merge_profiles(root) if with_root else []
+        if self._switched:  # profil en cours supprimé depuis un autre appareil : fenêtre rouverte
+            return
+        changed, lib_writes = sync.library_writes(self.library, doc, self.profile_id)
+        if changed:
+            self._library_changed()
+        writes += lib_writes
+        if not writes:
+            self._sync_done(None)
+            return
+        session = self.cloud
+        run_async(cloud_task(lambda: session.commit(writes)), self._sync_done)
+
+    def _merge_profiles(self, root) -> list:
+        """Liste des profils du foyer : profils ajoutés, renommés ou supprimés sur un autre appareil."""
+        name = self._profile()["name"]
+        changed, writes, removed, added = sync.profiles_writes(self.cfg, root, self.cloud.uid)
+        if not changed:
+            return writes
+        current_gone = self.profile_id in removed
+        sync.apply_profiles(self.cfg, removed, added, None if current_gone else self.profile_id)
+        if current_gone:
+            session = self.cloud
+            run_async(cloud_task(lambda: session.commit(writes)), lambda _: None)
+            other = self.cfg["profiles"][0]["id"]
+            config.save_common(self.cfg, other)
+            self._sync_busy = False
+            self.switch_profile(other, save=False,
+                                message=f"Le profil « {name} » a été supprimé depuis un autre appareil.")
+            return []
+        config.save(self.cfg, self.profile_id)
+        self._update_profile_btn()
+        return writes
+
+    def _sync_done(self, result):
+        if isinstance(result, cloud.CloudError):
+            self._sync_failed(result)
+            return
+        self._sync_busy = False
+        self._sync_error_shown = False
+
+    def _sync_failed(self, err: cloud.CloudError):
+        self._sync_busy = False
+        if self._switched:
+            return
+        if isinstance(err, (cloud.AuthError, cloud.Forbidden)):
+            self._session_lost("l'accès de ce compte a été retiré" if isinstance(err, cloud.Forbidden) else str(err))
+        elif not self._sync_error_shown:  # serveur injoignable : on réessaie au passage suivant, sans insister
+            self._sync_error_shown = True
+            self.statusBar().showMessage(f"Synchronisation impossible pour le moment ({err}). Nouvel essai dans "
+                                         "30 s ; tes données sont gardées sur ce PC.", 8000)
+
+    def _sync_now(self):
+        """Envoie tout de suite les dernières positions (fermeture, changement de profil) : quelques s au plus."""
+        if not self.cloud.signed_in:
+            return
+        try:
+            sync.sync_library_now(self.cloud, self.library, self.profile_id, timeout=4)
+        except cloud.CloudError:
+            pass  # envoyé au prochain lancement
+
+    def _library_changed(self):
+        """Favoris, reprises… modifiés (réinitialisation, synchro) : listes, accueil et fiche redessinés."""
+        if self.view == "list" and self.group_combo.currentData() in (FAV, RECENT):
+            self._apply_filter()
+        else:
+            self.model.refresh()
+        self._refresh_home()
+        if self.details_item is not None:
+            self._show_details(self.details_item)
 
     def set_omdb_key(self):
         key, ok = QInputDialog.getText(
@@ -1608,16 +1826,14 @@ class MainWindow(QMainWindow):
 
     def _launch_with_audio(self, it: playlist.Item, target: playlist.Item, t):
         """Bouton de langue de la fiche : mémorise la langue puis lance le film / l'épisode."""
-        self.track_prefs.setdefault(self._pref_key(target), {})["audio"] = t.pref()
-        config.save(self.cfg, self.profile_id)
+        self.library.set_pref(self._pref_key(target), "audio", t.pref())
         if it.kind == "series":
             self.open_series(it)  # vue des épisodes, comme un double-clic
             self._select_key(target.key)
         self.play_item(target, resume=True)
 
     def _choose_subtitles(self, it: playlist.Item, target: playlist.Item, t):
-        self.track_prefs.setdefault(self._pref_key(target), {})["spu"] = "off" if t is None else t.pref()
-        config.save(self.cfg, self.profile_id)
+        self.library.set_pref(self._pref_key(target), "spu", "off" if t is None else t.pref())
         self._show_tracks(it)
 
     def _plot_html(self, it: playlist.Item) -> str:
@@ -1731,7 +1947,7 @@ class MainWindow(QMainWindow):
         pos = self.library.resume_position(last)
         if pos:
             return eps[idx], pos
-        watched = set(entry.get("watched", ()))
+        watched = self.library.watched_keys(show.key)
         for e in eps[idx + 1:] + eps[:idx]:
             if e.key not in watched:
                 return e, self.library.resume_position(e.key)
@@ -1826,10 +2042,7 @@ class MainWindow(QMainWindow):
         if watched:
             lib.update(ep, 0, 0, finished=True)
         else:
-            entry = lib.recent.get(ep.parent.key)
-            if entry and ep.key in entry.get("watched", []):
-                entry["watched"].remove(ep.key)
-                lib.dirty = True
+            lib.set_unwatched(ep)
         lib.save()
         self.model.refresh()
 
@@ -2063,8 +2276,7 @@ class MainWindow(QMainWindow):
                 if t is None:
                     return
                 value = t.pref()
-            self.track_prefs.setdefault(key, {})[kind] = value
-            config.save(self.cfg, self.profile_id)
+            self.library.set_pref(key, kind, value)
             self._update_next_btn()
 
         self._probe(it.url, save)
@@ -2753,7 +2965,8 @@ class MainWindow(QMainWindow):
 
     # ---- Fermeture ------------------------------------------------------- #
     def closeEvent(self, event):
-        for timer in (self.ui_timer, self.watchdog, self.fs_timer, self.next_timer, self.tracks_timer):
+        for timer in (self.ui_timer, self.watchdog, self.fs_timer, self.next_timer, self.tracks_timer,
+                      self.sync_timer):
             timer.stop()
         power.keep_awake(False)
         self._exit_fullscreen()
@@ -2762,6 +2975,7 @@ class MainWindow(QMainWindow):
             self._save_progress()
             self.library.save()
             config.save(self.cfg, self.profile_id)
+            self._sync_now()
         else:  # fenêtre de l'ancien profil : on libère le catalogue
             self.by_tab, self.by_key = {k: [] for k, _ in TABS}, {}
             self.model.set_items([])
@@ -2826,6 +3040,16 @@ def main() -> int:
             config.save(cfg)
 
     global _main_window
+    session, notice = cloud.session(), ""
+    while True:
+        if not session.signed_in and not ask_account(notice=notice):
+            return 0
+        try:
+            sync.startup(session)  # profils du foyer, avant « Qui regarde ? »
+            break
+        except cloud.AuthError as e:
+            session.sign_out()
+            notice = f"Reconnexion nécessaire : {e}."
     cfg = config.load()
     if cfg.get("ask_profile", True) and len(cfg["profiles"]) > 1:
         picker = ProfilePicker(cfg["profiles"], config.current_profile())  # « Qui regarde ? »

@@ -1,7 +1,7 @@
 """Petits composants de l'interface : modèle de liste, zone vidéo, barre de progression,
 fenêtre de connexion et barres flottantes du plein écran."""
-from PySide6.QtCore import (QAbstractListModel, QEasingCurve, QMimeData, QModelIndex, QPoint, QPropertyAnimation,
-                            QRect, QSize, Qt, QTimer, Signal)
+from PySide6.QtCore import (Property, QAbstractListModel, QEasingCurve, QMimeData, QModelIndex, QPoint,
+                            QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, Signal)
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -307,7 +307,7 @@ class ConnectionDialog(QDialog):
 
         self.tabs.setCurrentIndex({"xtream": 0, "url": 1, "file": 2}.get(cfg.get("mode"), 0))
 
-        self.remember = QCheckBox("Mémoriser la connexion (stockée en clair sur ce PC)")
+        self.remember = Switch("Mémoriser la connexion (stockée en clair sur ce PC)")
         self.remember.setChecked(bool(cfg.get("remember", True)))
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -948,6 +948,73 @@ class ProfileDialog(QDialog):
         return self.name.text().strip(), color, bool(self.same is None or self.same.isChecked())
 
 
+class Switch(QCheckBox):
+    """Interrupteur (comme sur le téléphone) : piste arrondie, pastille qui glisse ; violet quand il est activé.
+    S'utilise comme une case à cocher (isChecked, toggled)."""
+
+    W, H = 44, 24
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self._pos = 0.0  # 0 : éteint, 1 : allumé (animé)
+        self._anim = QPropertyAnimation(self, b"knob", self)
+        self._anim.setDuration(160)
+        self._anim.setEasingCurve(QEasingCurve.InOutCubic)
+        self.toggled.connect(self._animate)
+
+    def _get_knob(self) -> float:
+        return self._pos
+
+    def _set_knob(self, v: float):
+        self._pos = v
+        self.update()
+
+    knob = Property(float, _get_knob, _set_knob)
+
+    def _animate(self, on: bool):
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(1.0 if on else 0.0)
+        self._anim.start()
+
+    def setChecked(self, on: bool):  # état initial : sans animation
+        super().setChecked(on)
+        self._anim.stop()
+        self._pos = 1.0 if on else 0.0
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        fm = self.fontMetrics()
+        text_w = fm.horizontalAdvance(self.text()) + 12 if self.text() else 0
+        return QSize(self.W + text_w + 4, max(self.H, fm.height()) + 4)
+
+    def hitButton(self, pos) -> bool:  # toute la ligne (interrupteur et texte) est cliquable
+        return self.rect().contains(pos)
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        y = (self.height() - self.H) / 2
+        track = QRectF(1, y, self.W, self.H)
+        off, on = QColor(ui.C["surface2"]), QColor(ui.C["accent"])
+        mix = QColor(int(off.red() + (on.red() - off.red()) * self._pos), int(off.green() + (on.green() - off.green()) * self._pos),
+                     int(off.blue() + (on.blue() - off.blue()) * self._pos))
+        p.setPen(QColor(ui.C["muted"]) if self._pos < 0.5 else Qt.NoPen)
+        p.setBrush(mix)
+        p.drawRoundedRect(track, self.H / 2, self.H / 2)
+        d = self.H - 8
+        x = track.left() + 4 + (self.W - 8 - d) * self._pos
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#FFFFFF") if self._pos >= 0.5 else QColor(ui.C["text"]))
+        p.drawEllipse(QRectF(x, y + 4, d, d))
+        if self.text():
+            p.setPen(QColor(ui.C["text"]))
+            p.drawText(QRect(int(track.right()) + 12, 0, self.width() - int(track.right()) - 12, self.height()),
+                       Qt.AlignVCenter | Qt.AlignLeft, self.text())
+        p.end()
+
+
 class ProfilePicker(QDialog):
     """« Qui regarde ? » : choix du profil au démarrage."""
 
@@ -979,6 +1046,10 @@ class ProfilePicker(QDialog):
                 b.setFocus()
         row.addStretch(1)
         lay.addLayout(row)
+        # Se souvenir du choix : au prochain démarrage, le profil choisi s'ouvre directement (réglage « ask_profile »,
+        # aussi dans « Gérer les profils »)
+        self.remember = Switch("Ouvrir directement ce profil la prochaine fois")
+        lay.addWidget(self.remember, 0, Qt.AlignCenter)
 
     def _choose(self, pid: str):
         self.chosen = pid
@@ -1138,7 +1209,7 @@ class ManageProfilesDialog(QDialog):
         self.rows = QVBoxLayout()
         self.rows.setSpacing(6)
         lay.addLayout(self.rows)
-        self.ask = QCheckBox("Demander « Qui regarde ? » au démarrage (avec plusieurs profils)")
+        self.ask = Switch("Demander « Qui regarde ? » au démarrage (avec plusieurs profils)")
         self.ask.setChecked(bool(cfg.get("ask_profile", True)))
         self.ask.toggled.connect(on_ask)
         lay.addWidget(self.ask)

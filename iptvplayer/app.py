@@ -85,7 +85,7 @@ from . import cast, cloud, downloads, library, power, sync, ui, update, vlc_load
 from . import tracks as tracklib
 from .images import ImageLoader
 from .sources import catalog, omdb, playlist, xtream
-from .widgets import (AccountDialog, ConnectionDialog, ControlsOverlay, GroupCombo, ItemList, ItemModel, ManageProfilesDialog,
+from .widgets import (Switch, AccountDialog, ConnectionDialog, ControlsOverlay, GroupCombo, ItemList, ItemModel, ManageProfilesDialog,
                       ProfileDialog, ProfilePicker, SeekSlider, ShortcutsDialog, SideMenu, VideoFrame, confirm,
                       DownloadsDialog, ItemCardDialog, ProgressDialog, UpdateDialog, inform)
 
@@ -970,11 +970,24 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda _=False, a=action: (m.close(), QTimer.singleShot(0, a)))
             grid.addWidget(b, i // 3, i % 3)
         v.addLayout(grid)
+        if len(self.cfg["profiles"]) > 1:  # « Qui regarde ? » au démarrage (aussi dans « Gérer les profils »)
+            ask = Switch("Demander au démarrage")
+            ask.setToolTip("Afficher « Qui regarde ? » à chaque ouverture ; sinon le dernier profil s'ouvre directement")
+            ask.setChecked(bool(self.cfg.get("ask_profile", True)))
+            ask.toggled.connect(self._set_ask_profile)
+            v.addSpacing(6)
+            v.addWidget(ask)
         wa = QWidgetAction(m)
         wa.setDefaultWidget(box)
         m.addAction(wa)
         m.addSeparator()
         m.addAction(ui.icon("edit", ui.C["muted"]), "Gérer les profils…").triggered.connect(self.manage_profiles)
+
+    def _set_ask_profile(self, on: bool):
+        self.cfg["ask_profile"] = on
+        if not on:  # le profil en cours devient celui du démarrage
+            self.cfg["start_profile"] = self.profile_id
+        config.save(self.cfg, self.profile_id)
 
     def manage_profiles(self):
         """Fenêtre « Gérer les profils » : modifier, source IPTV, supprimer, « Qui regarde ? »."""
@@ -1043,8 +1056,7 @@ class MainWindow(QMainWindow):
             return False
 
         def ask(on):
-            self.cfg["ask_profile"] = on
-            config.save(self.cfg, self.profile_id)
+            self._set_ask_profile(on)
 
         dlg = ManageProfilesDialog(self, self.cfg, self.profile_id, edit, source, reset, delete, ask)
         dlg.exec()
@@ -3655,6 +3667,13 @@ def main() -> int:
         picker = ProfilePicker(cfg["profiles"], config.current_profile())  # « Qui regarde ? »
         picker.exec()
         config.set_profile(picker.chosen)
+        if picker.remember.isChecked():  # plus de « Qui regarde ? » : réactivable dans le menu du profil
+            cfg = config.load()
+            cfg["ask_profile"] = False
+            cfg["start_profile"] = picker.chosen  # celui-ci, même si on change de profil ensuite dans l'appli
+            config.save_common(cfg, picker.chosen)
+    elif cfg.get("start_profile") in [p["id"] for p in cfg["profiles"]]:
+        config.set_profile(cfg["start_profile"])  # profil de démarrage retenu (pas le dernier utilisé)
     _main_window = MainWindow()
     _main_window.showMaximized()
     if front is not None:

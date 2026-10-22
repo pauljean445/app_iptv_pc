@@ -30,6 +30,7 @@ DEFAULTS = {
     "omdb_api_key": "",        # clé gratuite omdbapi.com pour afficher les notes IMDb
     "vlc_dir": "",             # dossier de VLC si installation portable (contient libvlc.dll)
     "ask_profile": True,       # « Qui regarde ? » au démarrage quand il y a plusieurs profils
+    "start_profile": "",       # sinon, profil ouvert au démarrage (choisi avec l'interrupteur ; "" : le dernier utilisé)
 }
 
 # Réglages propres à chaque profil sur cet appareil ; tous les autres sont communs

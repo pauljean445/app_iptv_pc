@@ -1,5 +1,6 @@
 """Fenêtre principale et démarrage d'IPTV Player (interface PySide6, lecture libVLC). Lancé par main.py."""
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -50,8 +51,8 @@ sys.excepthook = _excepthook
 if sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
-from PySide6.QtCore import QObject, QPersistentModelIndex, QSize, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QActionGroup, QCursor, QFont, QIcon, QKeySequence, QPixmap
+from PySide6.QtCore import QEvent, QObject, QPersistentModelIndex, QSize, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QFont, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -78,12 +79,13 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from . import cast, cloud, library, power, sync, ui, update, vlc_loader
+from . import cast, cloud, downloads, library, power, sync, ui, update, vlc_loader
 from . import tracks as tracklib
 from .images import ImageLoader
 from .sources import catalog, omdb, playlist, xtream
 from .widgets import (AccountDialog, ConnectionDialog, ControlsOverlay, GroupCombo, ItemList, ItemModel, ManageProfilesDialog,
-                      ProfileDialog, ProfilePicker, SeekSlider, ShortcutsDialog, SideMenu, VideoFrame, confirm)
+                      ProfileDialog, ProfilePicker, SeekSlider, ShortcutsDialog, SideMenu, VideoFrame, confirm,
+                      DownloadsDialog, ItemCardDialog, ProgressDialog, UpdateDialog, inform)
 
 
 vlc, VLC_ERROR = vlc_loader.load()
@@ -94,10 +96,14 @@ SYNC_ROOT_EVERY = 4     # … et la liste des profils un passage sur 4 (2 min)
 TABS = [("live", "Direct"), ("movie", "Films"), ("series", "Séries"), ("replay", "Replays")]
 TAB_ICONS = {"live": "live", "movie": "film", "series": "series", "replay": "replay"}
 TAB_COUNT = {"live": "chaînes", "movie": "films", "series": "séries", "replay": "chaînes en replay"}
+SEARCH_TAB = len(TABS) + 1  # onglet « Recherche » (page à part), après Accueil et les onglets de contenu
+SEARCH_MIN = 2              # nombre de lettres minimum pour chercher
+SEARCH_MAX = 300            # résultats affichés au plus par bande
 SEEKABLE = {"movie", "episode", "program"}  # contenus avec barre de progression
 RESUMABLE = {"movie", "episode"}            # contenus dont on mémorise la position
 AUTO_NEXT_MS = 0                            # délai avant l'épisode / le programme suivant (aucun)
 ALL, FAV, RECENT = "", "\x00fav", "\x00recent"  # valeurs spéciales du filtre de groupe
+OTHERS = "\x00others"  # « Autres » : en-tête (dépliable) des catégories masquées
 POSTER_ICON = QSize(32, 48)
 LOGO_ICON = QSize(40, 30)
 PROGRAMS_TTL = 300  # secondes avant de redemander la liste des replays d'une chaîne
@@ -173,6 +179,24 @@ def ask_account(parent=None, notice: str = "") -> bool:
 
     dlg = AccountDialog(parent, session.email, False, sign_in, session.sign_out, notice)
     return dlg.exec() == QDialog.Accepted and session.signed_in
+
+
+VAULT_INTRO = ("Nouveauté : l'abonnement IPTV peut servir à configurer tes nouveaux appareils (nouvelle TV, "
+               "nouveau PC) sans retaper les identifiants. Il est stocké <b>chiffré</b> dans le compte : ni Google ni "
+               "Firebase ne peuvent le lire. Saisis une fois le mot de passe du compte (il n'est pas enregistré : il "
+               "sert seulement à calculer la clé). Chaque appareil garde son propre abonnement.")
+
+
+def ask_vault(parent=None) -> bool:
+    """Mot de passe du compte, une fois, pour le partage chiffré de la source IPTV (clé dérivée du mot de passe)."""
+    session = cloud.session()
+
+    def sign_in(email, password, on_ok, on_error):
+        run_async(lambda: session.sign_in(email, password), lambda _=None: on_ok(), on_error)
+
+    dlg = AccountDialog(parent, session.email, False, sign_in, session.sign_out, intro=VAULT_INTRO,
+                        cancel_label="Plus tard")
+    return dlg.exec() == QDialog.Accepted and session.vault_key is not None
 
 
 def cloud_task(fn):
@@ -495,6 +519,15 @@ class MainWindow(QMainWindow):
         self.group_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.group_combo.setMinimumContentsLength(12)
         self.group_combo.currentIndexChanged.connect(self._on_group_changed)
+        # Clic droit sur une catégorie (liste ouverte ou fermée) : la masquer / la réafficher. Dans la liste ouverte,
+        # les clics sont filtrés (eventFilter) : un clic droit ne choisit pas la catégorie, un clic sur « Autres »
+        # le déplie sur place sans refermer la liste
+        self._others_open = False
+        self._group_viewport = self.group_combo.view().viewport()
+        self._group_viewport.installEventFilter(self)
+        self.group_combo.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.group_combo.customContextMenuRequested.connect(
+            lambda pos: self._group_menu(self.group_combo.currentData(), self.group_combo.mapToGlobal(pos)))
 
         self.model = ItemModel(lambda it: it.name, lambda it: None)
         self.list = ItemList()
@@ -522,6 +555,9 @@ class MainWindow(QMainWindow):
         self.details.play_btn.clicked.connect(lambda: self._details_action("play"))
         self.details.alt_btn.clicked.connect(lambda: self._details_action("alt"))
         self.details.fav_btn.clicked.connect(lambda: self._details_action("fav"))
+        self.details.dl_btn.clicked.connect(self._details_download)
+        self.downloads = downloads.manager()  # commun à toute l'appli (continue pendant un changement de profil)
+        self.downloads.changed.connect(self._update_dl_btn)
 
         self.count_label = QLabel("Aucune playlist chargée")
         self.count_label.setObjectName("countLabel")
@@ -724,11 +760,20 @@ class MainWindow(QMainWindow):
         # Page d'accueil (mosaïques) et pages de navigation, sous un bandeau commun
         self.home = ui.HomePage(self.images)
         self.home.openTab.connect(self.show_browse)
+        self.search_page = ui.SearchPage(self.images)
+        self.search_page.tileClicked.connect(self._open_from_search)
+        self.search_page.openTab.connect(self.show_browse)
+        self.search_timer = QTimer(self)  # recherche après une courte pause dans la frappe
+        self.search_timer.setSingleShot(True)
+        self.search_timer.setInterval(250)
+        self.search_timer.timeout.connect(self._run_search)
+        self.search_page.field.textChanged.connect(lambda _: self.search_timer.start())
         self.home.tileClicked.connect(self._on_tile)
         self.home.tileRemoved.connect(self._on_tile_removed)
         self.pages = QStackedWidget()
         self.pages.addWidget(self.home)
         self.pages.addWidget(self.browse)
+        self.pages.addWidget(self.search_page)
 
         central = QWidget()
         cv = QVBoxLayout(central)
@@ -754,7 +799,7 @@ class MainWindow(QMainWindow):
         h.addWidget(logo)
         h.addWidget(brand)
         h.addSpacing(18)
-        self.tabs = ui.NavBar(["home"] + [TAB_ICONS[k] for k, _ in TABS])
+        self.tabs = ui.NavBar(["home"] + [TAB_ICONS[k] for k, _ in TABS] + ["search"])
         self.tabs.setObjectName("nav")
         self.tabs.setIconSize(QSize(18, 18))
         self.tabs.setExpanding(False)
@@ -764,6 +809,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab("Accueil")
         for _, label in TABS:
             self.tabs.addTab(label)
+        self.tabs.addTab("Recherche")
+        self.tabs.setTabToolTip(SEARCH_TAB, "Rechercher un film ou une série")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         h.addWidget(self.tabs)
         h.addStretch(1)
@@ -775,6 +822,18 @@ class MainWindow(QMainWindow):
         self.now_btn.clicked.connect(self.show_player)
         self.now_btn.hide()
         h.addWidget(self.now_btn)
+        # Téléchargements en cours : bouton visible seulement quand il y en a (nombre et progression)
+        self.dl_btn = QToolButton()
+        self.dl_btn.setObjectName("burger")
+        self.dl_btn.setIcon(ui.icon("download", ui.C["accent_hi"]))
+        self.dl_btn.setIconSize(QSize(18, 18))
+        self.dl_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.dl_btn.setCursor(Qt.PointingHandCursor)
+        self.dl_btn.setFocusPolicy(Qt.NoFocus)
+        self.dl_btn.setToolTip("Téléchargements")
+        self.dl_btn.clicked.connect(self.open_downloads)
+        self.dl_btn.hide()
+        h.addWidget(self.dl_btn)
         # Profil en cours : pastille + nom ; menu pour changer de profil ou en créer un
         self.profile_btn = QToolButton()
         self.profile_btn.setObjectName("profileBtn")
@@ -867,6 +926,7 @@ class MainWindow(QMainWindow):
             d = ConnectionDialog(data, dlg)
             if d.exec() == QDialog.Accepted:
                 data.update(d.values())
+                data["source_t"] = time.time()
                 config.write_profile(pid, data)
             return False
 
@@ -1010,7 +1070,7 @@ class MainWindow(QMainWindow):
                 continue
             prog = lib.progress.get(k, {})
             pos, length = prog.get("pos", 0), prog.get("len", 0)
-            sub = f"Reprendre à {fmt_time(pos)}" if pos else "À reprendre"
+            sub = f"Reprendre à {fmt_time(pos)}" if pos else "Commencé"
             movies.append(ui.Tile(it, it.name, sub, pos / length if length else -1))
         series = []
         for k in lib.recent_keys("series"):
@@ -1021,7 +1081,9 @@ class MainWindow(QMainWindow):
             prog = lib.progress.get(entry.get("last_ep", ""), {})
             pos, length = prog.get("pos", 0), prog.get("len", 0)
             label = entry.get("last_label", "")
-            sub = (f"{label} · reprendre à {fmt_time(pos)}" if pos else f"Après {label}") if label else "En cours"
+            done = entry.get("last_ep") in lib.watched
+            sub = ((f"{label} · reprendre à {fmt_time(pos)}" if pos else f"Après {label}" if done else f"{label} · commencé")
+                   if label else "En cours")
             series.append(ui.Tile(it, it.name, sub, pos / length if length else -1))
 
         wait = "Chargement du catalogue…"
@@ -1120,6 +1182,7 @@ class MainWindow(QMainWindow):
             [("plug", "Connexion IPTV", self.open_connection), ("reload", "Recharger", self.reload_playlist),
              ("fullscreen", "Plein écran", self.toggle_fullscreen)],
             [[("account", "Compte du foyer", "", self.open_account),
+              ("download", "Téléchargements", "", self.open_downloads),
               ("star", "Notes IMDb (clé OMDb)", "", self.set_omdb_key),
               ("keyboard", "Raccourcis clavier", "?", self.show_shortcuts),
               ("download", "Mise à jour", f"v{__version__}", lambda: self.check_update(silent=False))],
@@ -1131,65 +1194,49 @@ class MainWindow(QMainWindow):
         """Cherche une version plus récente ; silent : au démarrage, rien n'est affiché s'il n'y en a pas."""
         if not update.supported():
             if not silent:
-                QMessageBox.information(self, "Mise à jour",
-                                        "La mise à jour depuis l'appli concerne la version installée "
-                                        "(installeur), pas le lancement depuis les sources.")
+                inform(self, "Mise à jour", "La mise à jour depuis l'appli concerne la version installée "
+                                            "(installeur), pas le lancement depuis les sources.")
             return
 
         def done(info):
             if info is None:
                 if not silent:
-                    QMessageBox.information(self, "Mise à jour", f"Tu as la dernière version ({__version__}).")
+                    inform(self, "Mise à jour", f"Tu as la dernière version ({__version__}).")
                 return
-            notes = info["notes"][:1200]
-            box = QMessageBox(QMessageBox.Question, "Mise à jour disponible",
-                              f"La version {info['version']} est disponible (tu as la {__version__}).\n\n"
-                              "L'appli va la télécharger, se fermer puis se relancer d'elle-même. "
-                              "Tes réglages, favoris et reprises de lecture sont conservés.", parent=self)
-            if notes:
-                box.setDetailedText(notes)
-            install = box.addButton("Mettre à jour", QMessageBox.AcceptRole)
-            box.addButton("Plus tard", QMessageBox.RejectRole)
-            box.exec()
-            if box.clickedButton() is install:
+            if UpdateDialog(self, info["version"], __version__, info["notes"][:3000]).exec() == QDialog.Accepted:
                 self._download_update(info)
 
         def failed(msg):
             if not silent:
-                QMessageBox.warning(self, "Mise à jour", f"Impossible de vérifier les mises à jour : {msg}.")
+                inform(self, "Mise à jour", f"Impossible de vérifier les mises à jour : {msg}.", error=True)
 
         run_async(update.check, done, failed)
 
     def _download_update(self, info: dict):
-        dlg = QProgressDialog(f"Téléchargement de la version {info['version']}…", "Annuler", 0, 100, self)
-        dlg.setWindowTitle("Mise à jour")
-        dlg.setWindowModality(Qt.WindowModal)
-        dlg.setMinimumDuration(0)
-        dlg.setAutoClose(False)
-        dlg.setAutoReset(False)
-        dlg.setValue(0)
         cancel = threading.Event()
-        dlg.canceled.connect(cancel.set)
+        dlg = ProgressDialog(self, "Mise à jour", f"Téléchargement de la version <b>{info['version']}</b>…", cancel.set)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.show()
 
         def progress(value):
             got, total = value
-            if total and not cancel.is_set():
-                dlg.setValue(int(got * 100 / total))
+            if not cancel.is_set():
+                dlg.set_progress(got, total)
 
         def done(path):
-            dlg.close()
+            dlg.accept()
             try:
                 update.install(path)
             except OSError as exc:
-                QMessageBox.warning(self, "Mise à jour", f"Impossible de lancer l'installeur : {exc}")
+                inform(self, "Mise à jour", f"Impossible de lancer l'installeur : {exc}", error=True)
                 return
             self.close()  # sauvegarde la position de lecture et les réglages
             QApplication.instance().quit()
 
         def failed(msg):
-            dlg.close()
+            dlg.accept()
             if not cancel.is_set():
-                QMessageBox.warning(self, "Mise à jour", f"Le téléchargement a échoué : {msg}.")
+                inform(self, "Mise à jour", f"Le téléchargement a échoué : {msg}.", error=True)
 
         run_async(lambda: update.download(info, lambda got, total: _emit(progress, (got, total)), cancel.is_set),
                   done, failed)
@@ -1216,7 +1263,9 @@ class MainWindow(QMainWindow):
         dlg = ConnectionDialog(self.cfg, self)
         if dlg.exec() == QDialog.Accepted:
             self.cfg.update(dlg.values())
+            self.cfg["source_t"] = time.time()  # changement fait ici : envoyé (chiffré) au compte du foyer
             config.save(self.cfg, self.profile_id)
+            self._sync_soon()
             src = playlist.source_from_config(self.cfg)
             if src:
                 self.catalog_sig = None
@@ -1326,7 +1375,11 @@ class MainWindow(QMainWindow):
         elif self.view == "list":
             # Actualisation : même onglet, même filtre, même sélection, même position de défilement
             scroll = self.list.verticalScrollBar().value()
-            self._populate_groups(self.group_combo.currentData())
+            selected = self.tab_group.get(self.tab, ALL)
+            if self.group_combo.view().isVisible():  # liste des catégories ouverte : mise à jour sur place
+                self._update_groups_in_place(selected)
+            else:
+                self._populate_groups(selected)
             self._apply_filter()
             self.list.verticalScrollBar().setValue(scroll)
         # (dans une sous-vue épisodes / replays, la liste sera reconstruite au retour)
@@ -1355,7 +1408,8 @@ class MainWindow(QMainWindow):
             self._sync_now()  # dernières modifications envoyées au compte que l'on quitte
             self.cloud.sign_out()
 
-        dlg = AccountDialog(self, self.cloud.email, True, None, sign_out)
+        dlg = AccountDialog(self, self.cloud.email, True, None, sign_out,
+                            vault_active=self.cloud.vault_key is not None, on_vault=lambda: self._activate_vault())
         if dlg.exec() != QDialog.Accepted or self.cloud.signed_in:
             return
         self.stop()
@@ -1363,6 +1417,11 @@ class MainWindow(QMainWindow):
             self._after_login()
         else:
             self.close()
+
+    def _activate_vault(self):
+        if ask_vault(self):
+            self.statusBar().showMessage("Abonnement IPTV partagé (chiffré) avec tes autres appareils", 6000)
+            self._sync_soon()
 
     def _after_login(self):
         """Nouvelle connexion (peut-être à un autre compte) : profils du foyer, puis fenêtre rouverte."""
@@ -1423,6 +1482,16 @@ class MainWindow(QMainWindow):
         if changed:
             self._library_changed()
         writes += lib_writes
+        adopted, modified, fields = sync.source_writes(self.profile_id, self.cfg, doc, self.cloud.vault_key)
+        writes = sync.with_fields(writes, self.profile_id, fields)
+        if modified:
+            config.save(self.cfg, self.profile_id)
+        if adopted:  # ce profil n'avait pas d'abonnement sur ce PC : celui du compte (déchiffré)
+            self.statusBar().showMessage("Abonnement IPTV récupéré depuis le compte du foyer", 6000)
+            src = playlist.source_from_config(self.cfg)
+            if src:
+                self.catalog_sig = None
+                self._load(src, use_cache=True, initial=True)
         if not writes:
             self._sync_done(None)
             return
@@ -1473,12 +1542,15 @@ class MainWindow(QMainWindow):
         if not self.cloud.signed_in:
             return
         try:
-            sync.sync_library_now(self.cloud, self.library, self.profile_id, timeout=4)
+            if sync.sync_profile_now(self.cloud, self.library, self.profile_id, self.cfg, timeout=4)[2]:
+                config.save(self.cfg, self.profile_id)
         except cloud.CloudError:
             pass  # envoyé au prochain lancement
 
     def _library_changed(self):
         """Favoris, reprises… modifiés (réinitialisation, synchro) : listes, accueil et fiche redessinés."""
+        if self.view == "list":  # catégories masquées depuis un autre appareil
+            self._populate_groups(self.tab_group.get(self.tab, ALL))
         if self.view == "list" and self.group_combo.currentData() in (FAV, RECENT):
             self._apply_filter()
         else:
@@ -1514,18 +1586,154 @@ class MainWindow(QMainWindow):
         self._populate_groups(self.tab_group.get(tab, ALL))
         self._apply_filter()
 
+
     def _on_tab_changed(self, index: int):
         if index == 0:
             self.show_home()
         elif 1 <= index <= len(TABS):
             self.show_browse(TABS[index - 1][0])
+        elif index == SEARCH_TAB:
+            self.show_search()
 
     def _on_group_changed(self, _index):
+        if self.group_combo.currentData() == OTHERS:
+            # « Autres » se déplie / se replie : la liste reste ouverte, la catégorie choisie ne change pas
+            self._others_open = not self._others_open
+            self._populate_groups(self.tab_group.get(self.tab, ALL))
+            QTimer.singleShot(0, self._reopen_at_others)
+            return
         if self.view == "list":
             self.tab_group[self.tab] = self.group_combo.currentData()
         self._apply_filter()
         if self.model.reorderable:
             self.statusBar().showMessage("Glisse un favori pour changer l'ordre (ou Ctrl+↑ / Ctrl+↓)", 6000)
+
+    def _reopen_at_others(self):
+        """Choix de « Autres » au clavier : la liste se rouvre positionnée sur « Autres »."""
+        combo = self.group_combo
+        combo.showPopup()
+        i = combo.findData(OTHERS)
+        if i >= 0:
+            combo.view().scrollTo(combo.view().model().index(i, 0))
+            combo.view().setCurrentIndex(combo.view().model().index(i, 0))
+
+    def _hidden_groups(self) -> list[str]:
+        """Catégories masquées de l'onglet (par profil, synchronisées), dans l'ordre du fournisseur."""
+        return [g for g in self.tab_groups.get(self.tab, []) if self.library.is_hidden(self.tab, g)]
+
+    def eventFilter(self, obj, event):
+        if obj is not getattr(self, "_group_viewport", None):  # (aussi pendant la fermeture : liste détruite)
+            return super().eventFilter(obj, event)
+        view = self.group_combo.view()
+        if obj is view.viewport() and event.type() == QEvent.ContextMenu:
+            return True  # le menu est ouvert au relâchement du clic droit (ci-dessous)
+        if obj is view.viewport() and event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease,
+                                                        QEvent.MouseButtonDblClick):
+            pos = event.position().toPoint()
+            idx = view.indexAt(pos)
+            if event.button() == Qt.RightButton:  # jamais un choix : seulement le menu masquer / réafficher
+                if event.type() == QEvent.MouseButtonRelease and idx.isValid():
+                    self._group_menu(idx.data(Qt.UserRole), view.viewport().mapToGlobal(pos), keep_open=True)
+                return True
+            if event.button() == Qt.LeftButton and idx.isValid() and idx.data(Qt.UserRole) == OTHERS:
+                if event.type() == QEvent.MouseButtonRelease:
+                    self._toggle_others()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _toggle_others(self):
+        """Déplie / replie « Autres » sur place (liste ouverte, même position de défilement)."""
+        combo = self.group_combo
+        i = combo.findData(OTHERS)
+        if i < 0:
+            return
+        hidden = self._hidden_groups()
+        selected = self.tab_group.get(self.tab, ALL)
+        if self._others_open and selected in hidden:
+            return  # la catégorie affichée est dans « Autres » : il reste ouvert
+        self._others_open = not self._others_open
+        combo.blockSignals(True)
+        combo.setItemText(i, ("▾  " if self._others_open else "▸  ") + f"Autres · {len(hidden)}")
+        if self._others_open:
+            for k, g in enumerate(hidden):
+                combo.insertItem(i + 1 + k, "      " + g, g)
+                combo.setItemData(i + 1 + k, QColor(ui.C["muted"]), Qt.ForegroundRole)
+        else:
+            for _ in hidden:
+                combo.removeItem(i + 1)
+        combo.blockSignals(False)
+        # Pas de retour en haut de la liste : on défile juste ce qu'il faut pour montrer les catégories dépliées
+        view = combo.view()
+        last = i + (len(hidden) if self._others_open else 0)
+        view.scrollTo(view.model().index(last, 0))
+        view.scrollTo(view.model().index(i, 0))  # « Autres » reste visible
+
+    def _group_menu(self, group, global_pos, keep_open: bool = False):
+        """Clic droit sur une catégorie du fournisseur : la masquer (rangée dans « Autres ») ou la réafficher.
+        keep_open : depuis la liste ouverte, qui reste ouverte (pour en masquer plusieurs à la suite)."""
+        if self.view != "list" or group in (None, ALL, FAV, RECENT, OTHERS):
+            return
+        hidden = self.library.is_hidden(self.tab, group)
+        menu = QMenu(self)
+        menu.addAction("Réafficher la catégorie" if hidden else "Masquer la catégorie (rangée dans « Autres »)",
+                       lambda: self._set_group_hidden(group, not hidden, keep_open))
+        menu.exec(global_pos)
+
+    def _set_group_hidden(self, group: str, hide: bool, keep_open: bool = False):
+        """Masque / réaffiche une catégorie. keep_open : depuis la liste ouverte, qui reste ouverte au même endroit
+        (pour en masquer plusieurs à la suite) : les lignes sont modifiées sur place, sans reconstruire la liste."""
+        if not keep_open:
+            self.group_combo.hidePopup()
+        self.library.set_hidden(self.tab, group, hide)
+        current = self.tab_group.get(self.tab, ALL)
+        if hide and current == group:
+            current = ALL
+        self.tab_group[self.tab] = current
+        if keep_open and self.group_combo.view().isVisible():
+            self._update_groups_in_place(current)
+        else:
+            self._populate_groups(current)
+        self._apply_filter()
+        self.statusBar().showMessage(f"« {group} » " + ("rangée dans « Autres »" if hide else "réaffichée"), 5000)
+
+    def _update_groups_in_place(self, selected):
+        """Met la liste ouverte en accord avec les catégories masquées, ligne par ligne (défilement conservé)."""
+        combo = self.group_combo
+        bar = combo.view().verticalScrollBar()
+        scroll = bar.value()
+        hidden = self._hidden_groups()
+        visible = [g for g in self.tab_groups.get(self.tab, []) if g not in hidden]
+        open_ = bool(hidden) and (self._others_open or selected in hidden)
+        rows = [(g, g, False) for g in visible]  # (texte, donnée, grisé) attendus après les entrées fixes
+        if hidden:
+            rows.append((("▾  " if open_ else "▸  ") + f"Autres · {len(hidden)}", OTHERS, False))
+            if open_:
+                rows += [("      " + g, g, True) for g in hidden]
+        first = next(k for k in range(combo.count()) if combo.itemData(k) not in (ALL, FAV, RECENT))
+        combo.blockSignals(True)
+        k = first
+        for text, data, muted in rows:
+            if k < combo.count() and combo.itemData(k) == data and combo.itemText(k) == text:
+                k += 1
+                continue
+            # ligne différente : on retire les lignes en trop jusqu'à retrouver la bonne, sinon on l'insère
+            match = next((j for j in range(k, combo.count()) if combo.itemData(j) == data and combo.itemText(j) == text), None)
+            if match is not None:
+                for _ in range(match - k):
+                    combo.removeItem(k)
+            else:
+                combo.insertItem(k, text, data)
+                if muted:
+                    combo.setItemData(k, QColor(ui.C["muted"]), Qt.ForegroundRole)
+            k += 1
+        while combo.count() > k:
+            combo.removeItem(k)
+        i = combo.findData(selected)
+        if combo.currentIndex() != (i if i >= 0 else 0):  # sinon la liste défilerait jusqu'à la sélection
+            combo.setCurrentIndex(i if i >= 0 else 0)
+        combo.blockSignals(False)
+        bar.setValue(scroll)
+        QTimer.singleShot(0, lambda: bar.setValue(scroll))
 
     def _populate_groups(self, selected=ALL):
         combo = self.group_combo
@@ -1536,12 +1744,21 @@ class MainWindow(QMainWindow):
             combo.addItem("★ Favoris", FAV)
             if self.tab in ("movie", "series"):
                 combo.addItem("🕘 Vu récemment", RECENT)
-            groups = self.tab_groups.get(self.tab, [])
+            hidden = self._hidden_groups()
+            groups = [g for g in self.tab_groups.get(self.tab, []) if g not in hidden]
         else:
             combo.addItem("Toutes les saisons" if self.view == "episodes" else "Tous les jours", ALL)
             groups = dict.fromkeys(i.group_label for i in self.view_items)
+            hidden = []
         for g in groups:
             combo.addItem(g, g)
+        if hidden:  # catégories masquées : sous « Autres », en grisé, quand il est déplié
+            open_ = self._others_open or selected in hidden
+            combo.addItem(("▾  " if open_ else "▸  ") + f"Autres · {len(hidden)}", OTHERS)
+            if open_:
+                for g in hidden:
+                    combo.addItem("      " + g, g)
+                    combo.setItemData(combo.count() - 1, QColor(ui.C["muted"]), Qt.ForegroundRole)
         i = combo.findData(selected)
         combo.setCurrentIndex(i if i >= 0 else 0)
         combo.blockSignals(False)
@@ -1559,6 +1776,8 @@ class MainWindow(QMainWindow):
             items = [self.by_key[k] for k in self.library.recent_keys(self.tab) if k in self.by_key]
         elif group:
             items = [i for i in base if i.group_label == group]
+        elif self.view == "list" and (hidden := set(self._hidden_groups())):
+            items = [i for i in base if i.group_label not in hidden]  # « Toutes » sans les catégories masquées
         else:
             items = base
         if text:
@@ -1603,6 +1822,180 @@ class MainWindow(QMainWindow):
 
     def _select_current(self) -> bool:
         return self.current is not None and self._select_key(self.current.key)
+
+    # ---- Recherche (page à part : bandes Films et Séries) ---------------------- #
+    def show_search(self):
+        self.pages.setCurrentWidget(self.search_page)
+        self.tabs.blockSignals(True)
+        self.tabs.setCurrentIndex(SEARCH_TAB)
+        self.tabs.blockSignals(False)
+        self._run_search()
+        self.search_page.field.setFocus()
+        self.search_page.field.selectAll()
+        self._update_now_playing()
+
+    def _run_search(self):
+        """Films et séries dont le nom contient le texte (sans accents) : une bande chacun."""
+        text = _norm(self.search_page.field.text().strip())
+        if len(text) < SEARCH_MIN:
+            self.search_page.set_results(None, None, "Tape au moins 2 lettres pour chercher un film ou une série.")
+            return
+        lib = self.library
+
+        def tiles(kind):
+            found = [i for i in self.by_tab.get(kind, []) if text in self._norm_name(i)]
+            out = []
+            for it in found[:SEARCH_MAX]:
+                sub = " · ".join(x for x in (it.year, f"★ {it.rating}" if it.rating else "") if x) or it.group_label
+                pos, length = lib.resume_position(it.key), lib.progress.get(it.key, {}).get("len", 0)
+                out.append(ui.Tile(it, it.name, sub, pos / length if pos and length else -1))
+            return out, len(found)
+
+        (films, n_films), (series, n_series) = tiles("movie"), tiles("series")
+        more = " (300 premiers affichés)" if max(n_films, n_series) > SEARCH_MAX else ""
+        self.search_page.set_results(
+            films, series, f"{n_films} film{'s' if n_films > 1 else ''}, {n_series} série{'s' if n_series > 1 else ''}{more}")
+
+    def _open_from_search(self, kind: str, it: playlist.Item):
+        """Clic sur un résultat : sa fiche dans une fenêtre par-dessus la recherche (Échap : retour aux résultats).
+        Descriptif du film / épisodes de la série chargés en arrière-plan, affiche dès qu'elle arrive."""
+        it = self.by_key.get(it.key, it)  # catalogue actualisé depuis la recherche : la version à jour
+        dlg = ItemCardDialog(self, "Film" if kind == "movie" else "Série")
+        state = {"open": True, "failed": False}
+
+        def refresh(_=None):
+            if state["open"]:
+                self._fill_card(dlg, kind, it, state["failed"])
+
+        def on_image(url):
+            if url == it.logo:
+                refresh()
+
+        def failed(_msg):
+            state["failed"] = True
+            refresh()
+
+        self.images.loaded.connect(on_image)
+        refresh()
+        need_info = self.client is not None and kind == "movie" and not it.info_loaded
+        need_eps = self.client is not None and kind == "series" and it.episodes is None
+        if need_info or need_eps:
+            client = self.client
+            run_async(lambda: client.fill_movie_info(it) if need_info else client.load_episodes(it), refresh, failed)
+        elif kind == "series" and it.episodes is None:
+            it.episodes = []  # playlist M3U sans API : rien à charger
+            refresh()
+        dlg.exec()
+        state["open"] = False
+        self.images.loaded.disconnect(on_image)
+
+    def _card_tracks(self, dlg, kind: str, it: playlist.Item, failed: bool):
+        """Langues et sous-titres dans la fiche de la recherche (même fonctionnement que la fiche des onglets)."""
+        target = self._lang_target(it) if (kind == "movie" or self.client is not None) else None
+        if target is None:
+            dlg.tracks.set_message("" if kind == "movie" or it.episodes == [] or failed
+                                   else "Recherche des langues disponibles…")
+            return
+        found = self._track_cache.get(target.url)
+        if not found:
+            if target.url in dlg.probed:
+                dlg.tracks.set_message("Langues non disponibles pour ce fichier.")
+                return
+            dlg.probed.add(target.url)
+            dlg.tracks.set_message("Recherche des langues disponibles…")
+            self._probe(target.url, lambda _found: dlg.isVisible() and self._fill_card(dlg, kind, it, failed))
+            return
+
+        def audio(t):
+            dlg.accept()
+            self.show_browse(kind)
+            self._launch_with_audio(it, target, t)
+
+        def sub(t):
+            self.library.set_pref(self._pref_key(target), "spu", "off" if t is None else t.pref())
+            self._fill_card(dlg, kind, it, failed)
+
+        dlg.tracks.set_entries(*self._track_entries(target, found, audio, sub))
+
+    def _fill_card(self, dlg, kind: str, it: playlist.Item, failed: bool):
+        lib = self.library
+        if not hasattr(dlg, "probed"):
+            dlg.probed = set()  # fichiers dont les pistes ont déjà été demandées
+        self._card_tracks(dlg, kind, it, failed)
+        pm = self.images.pixmap(it.logo, dlg.poster.width(), dlg.poster.height(), large=True) if it.logo else None
+        dlg.set_poster(pm, "…" if it.logo and not self.images.has_failed(it.logo, True) else "Pas d'image")
+        meta = [_esc(x) for x in (it.year, it.genre, it.duration) if x]
+        if it.imdb_rating:
+            meta.append(f"<b>IMDb ★ {_esc(it.imdb_rating)}</b>")
+        elif it.rating:
+            meta.append(f"★ {_esc(it.rating)}/10")
+        credits = []
+        if it.director:
+            credits.append(f"<b>Réalisation</b> : {_esc(it.director)}")
+        if it.cast:
+            credits.append(f"<b>Avec</b> : {_esc(it.cast)}")
+        dlg.set_info(it.name, " · ".join(meta), self._plot_html(it), "<br>".join(credits))
+
+        def close_then(action):
+            return lambda: (dlg.accept(), action())
+
+        specs = []
+        if kind == "movie":
+            pos = lib.resume_position(it.key)
+            specs.append((f"▶ Reprendre à {fmt_time(pos)}" if pos else "▶ Lire", "primary",
+                          close_then(lambda: self._play_from_search("movie", it, None, True)), None, True))
+            if pos:
+                specs.append(("Depuis le début", "secondary",
+                              close_then(lambda: self._play_from_search("movie", it, None, False)), None, True))
+        elif it.episodes:
+            target = self._series_resume_target(it)
+            ep, pos = target if target else (it.episodes[0], 0)
+            label = f"S{ep.season:02d}E{ep.episode:02d}" if (ep.season or ep.episode) else ep.name
+            specs.append((f"▶ Reprendre {label} à {fmt_time(pos)}" if pos else f"▶ Lire {label}", "primary",
+                          close_then(lambda: self._play_from_search("series", it, ep, True)), None, True))
+        else:
+            text = "Épisodes indisponibles" if failed or it.episodes == [] else "Chargement des épisodes…"
+            specs.append((text, "primary", None, None, False))
+        fav = lib.is_favorite(kind, it.key)
+
+        def toggle_fav():
+            lib.toggle_favorite(kind, it.key)
+            self._library_changed()
+            self._fill_card(dlg, kind, it, failed)
+
+        specs.append(("★  Favori" if fav else "☆  Favori", "secondary", toggle_fav, None, True))
+        specs.append(("", "secondary", None, "download", kind == "movie" or bool(it.episodes)))
+        specs.append(("Fiche complète", "secondary", close_then(lambda: self._show_in_tab(kind, it)), None, True))
+        buttons = dlg.set_buttons(specs)
+        dl = buttons[-2]
+        dl.setToolTip("Télécharger le film sur le disque" if kind == "movie"
+                      else "Télécharger une saison (ou toute la série) sur le disque")
+        dl.clicked.connect(lambda: self._download_menu(it, dl))
+
+    def _play_from_search(self, kind: str, it: playlist.Item, ep, resume: bool):
+        """Lecture depuis la fiche de la recherche (comme depuis l'accueil : dans l'onglet Films / Séries)."""
+        self.show_browse(kind)
+        if kind == "movie":
+            self._select_key(it.key, center=True)
+            self.play_item(it, resume=resume)
+        else:
+            self.open_series(it)
+            self.play_item(ep, resume=resume)
+
+    def _show_in_tab(self, kind: str, it: playlist.Item):
+        """« Fiche complète » : la fiche dans l'onglet Films / Séries (langues, épisodes…)."""
+        it = self.by_key.get(it.key, it)
+        self.show_browse(kind)
+        if self.view != "list":
+            self._leave_sub_view(restore=False)
+        self.search.blockSignals(True)
+        self.search.clear()  # filtre de l'onglet : rien, pour retrouver le résultat dans la liste
+        self.search.blockSignals(False)
+        self.tab_group[kind] = ALL
+        self._populate_groups(ALL)
+        self._apply_filter()
+        self._select_key(it.key, center=True)
+        self._show_details(it)
 
     def _focus_search(self):
         if self._fullscreen:
@@ -1732,6 +2125,10 @@ class MainWindow(QMainWindow):
         lib = self.library
         d.alt_btn.hide()
         d.fav_btn.setVisible(it.kind in ("movie", "series"))
+        d.dl_btn.setVisible(it.kind in ("movie", "series", "episode"))
+        d.dl_btn.setToolTip({"movie": "Télécharger le film sur le disque",
+                             "series": "Télécharger une saison (ou toute la série) sur le disque",
+                             "episode": "Télécharger l'épisode sur le disque"}.get(it.kind, ""))
         if it.kind in ("movie", "series"):
             fav = lib.is_favorite(it.kind, it.key)
             d.fav_btn.setText("★  Favori" if fav else "☆  Favori")
@@ -1779,17 +2176,23 @@ class MainWindow(QMainWindow):
             d.set_tracks_message("Recherche des langues disponibles…")
             self.tracks_timer.start()
             return
+        d.set_tracks(*self._track_entries(target, found, lambda t: self._launch_with_audio(it, target, t),
+                                          lambda t: self._choose_subtitles(it, target, t)))
+
+    def _track_entries(self, target: playlist.Item, found: list, on_audio, on_sub):
+        """Boutons de langue (on_audio(piste) : lecture dans cette langue) et de sous-titres (on_sub(piste ou
+        None)) d'un fichier, avec le choix mémorisé coché. Retourne (audio, sous-titres, note)."""
         pref = self.track_prefs.get(self._pref_key(target), {})
         what = "le film" if target.kind == "movie" else f"S{target.season:02d}E{target.episode:02d}"
         audio = [(t.label, tracklib.is_pref(t, pref.get("audio")), f"Lancer {what} en {t.label}",
-                  lambda t=t: self._launch_with_audio(it, target, t)) for t in found if t.kind == "audio"]
+                  lambda t=t: on_audio(t)) for t in found if t.kind == "audio"]
         subs = [t for t in found if t.kind == "spu"]
         sub_entries = [("Aucun", pref.get("spu") == "off", "Lecture sans sous-titres",
-                        lambda: self._choose_subtitles(it, target, None))] if subs else []
+                        lambda: on_sub(None))] if subs else []
         sub_entries += [(t.label, tracklib.is_pref(t, pref.get("spu")), "Sous-titres de la lecture",
-                         lambda t=t: self._choose_subtitles(it, target, t)) for t in subs]
+                         lambda t=t: on_sub(t)) for t in subs]
         note = "Le choix est conservé pour les épisodes suivants." if target.kind == "episode" else ""
-        d.set_tracks(audio, sub_entries, note)
+        return audio, sub_entries, note
 
     def _probe_details(self):
         """Lit les pistes du fichier de la fiche affichée (et les épisodes d'une série si besoin)."""
@@ -1934,6 +2337,101 @@ class MainWindow(QMainWindow):
         elif it.kind == "program":
             self.play_item(it)
 
+    # ---- Téléchargements sur le disque ----------------------------------------- #
+    def _details_download(self):
+        it = self.details_item
+        if it is None:
+            return
+        if it.kind in ("movie", "episode"):
+            self._queue_downloads([it])
+            return
+        if it.kind != "series":
+            return
+        if it.episodes is None:  # épisodes pas encore chargés : on les charge, puis on propose les saisons
+            if self.client is None:
+                return
+            self.statusBar().showMessage(f"Chargement des épisodes de {it.name}…", 4000)
+            client = self.client
+            run_async(lambda: client.load_episodes(it),
+                      lambda _r=None: self.details_item is it and self._details_download(),
+                      lambda msg: self.statusBar().showMessage(f"Épisodes indisponibles : {msg}", 6000))
+            return
+        self._download_menu(it, self.details.dl_btn)
+
+    def _download_menu(self, it: playlist.Item, btn):
+        """Film / épisode : en file aussitôt ; série : menu des saisons (ou toute la série) sous le bouton btn."""
+        if it.kind in ("movie", "episode"):
+            self._queue_downloads([it])
+            return
+        eps = it.episodes
+        if not eps:
+            self.statusBar().showMessage("Aucun épisode à télécharger", 4000)
+            return
+        menu = QMenu(self)
+        for s in sorted({e.season for e in eps}):
+            n = sum(1 for e in eps if e.season == s)
+            menu.addAction(f"Saison {s}  ·  {n} épisode{'s' if n > 1 else ''}",
+                           lambda s=s: self._queue_downloads([e for e in eps if e.season == s]))
+        menu.addSeparator()
+        menu.addAction(f"Toute la série  ·  {len(eps)} épisodes", lambda: self._queue_downloads(list(eps)))
+        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _download_dir(self) -> Path | None:
+        """Dossier des téléchargements ; demandé au premier téléchargement (Téléchargements, disque externe…)."""
+        folder = self.cfg.get("download_dir", "")
+        if folder and Path(folder).is_dir():
+            return Path(folder)
+        return self._choose_download_dir(self)
+
+    def _choose_download_dir(self, parent) -> Path | None:
+        start = self.cfg.get("download_dir") or str(Path.home() / "Downloads")
+        folder = QFileDialog.getExistingDirectory(parent, "Où enregistrer les films et séries téléchargés ?", start)
+        if not folder:
+            return None
+        self.cfg["download_dir"] = folder
+        config.save(self.cfg, self.profile_id)
+        return Path(folder)
+
+    def _download_path(self, base: Path, it: playlist.Item) -> Path:
+        """Film : « Titre (année).ext » ; épisode : « Série/Saison 01/Série - S01E02 - Titre.ext »."""
+        from .downloads import safe_name
+        ext = it.ext or Path(it.url.split("?")[0]).suffix.lstrip(".") or "mp4"
+        if it.kind == "episode" and it.parent is not None:
+            show, _ = playlist.clean_title(it.parent.name)
+            label = playlist.episode_label(it).replace(" · ", " - ")
+            return (base / safe_name(show) / f"Saison {it.season:02d}"
+                    / f"{safe_name(f'{show} - {label}')}.{ext}")
+        title, year = playlist.clean_title(it.name)
+        year = year or it.year
+        return base / f"{safe_name(f'{title} ({year})' if year else title)}.{ext}"
+
+    def _queue_downloads(self, items: list):
+        base = self._download_dir()
+        if base is None:
+            return
+        entries = []
+        for it in items:
+            if not it.url:
+                continue
+            label = it.name if it.kind == "movie" else f"{it.parent.name if it.parent else ''} · {playlist.episode_label(it)}"
+            entries.append((label, it.url, self._download_path(base, it)))
+        added = self.downloads.add(entries)
+        if added:
+            self.statusBar().showMessage(
+                f"{added} téléchargement{'s' if added > 1 else ''} ajouté{'s' if added > 1 else ''} → {base}", 6000)
+        else:
+            self.statusBar().showMessage("Déjà téléchargé (ou déjà en file d'attente)", 5000)
+
+    def open_downloads(self):
+        folder = self.cfg.get("download_dir") or str(Path.home() / "Downloads")
+        DownloadsDialog(self, self.downloads, folder,
+                        lambda parent: (str(p) if (p := self._choose_download_dir(parent)) else None)).exec()
+
+    def _update_dl_btn(self):
+        text = self.downloads.summary()
+        self.dl_btn.setText(text)
+        self.dl_btn.setVisible(bool(text))
+
     def _series_resume_target(self, show: playlist.Item):
         """(épisode à reprendre, position) pour une série en cours, sinon None."""
         entry = self.library.recent.get(show.key)
@@ -1948,6 +2446,8 @@ class MainWindow(QMainWindow):
         if pos:
             return eps[idx], pos
         watched = self.library.watched_keys(show.key)
+        if last not in watched:
+            return eps[idx], 0  # épisode lancé moins de 15 s : on le relance depuis le début
         for e in eps[idx + 1:] + eps[:idx]:
             if e.key not in watched:
                 return e, self.library.resume_position(e.key)
@@ -2023,6 +2523,9 @@ class MainWindow(QMainWindow):
                 menu.addAction("Marquer comme non vu", lambda: self._set_watched(it, False))
             else:
                 menu.addAction("Marquer comme vu", lambda: self._set_watched(it, True))
+        if it.kind in ("movie", "episode") and it.url:
+            menu.addAction("Télécharger " + ("le film" if it.kind == "movie" else "l'épisode"),
+                           lambda: self._queue_downloads([it]))
         recent_key = it.parent.key if it.kind == "episode" else it.key
         if recent_key in lib.recent:
             menu.addAction("Retirer de « Vu récemment »", lambda: self._remove_recent(recent_key))
@@ -2965,6 +3468,12 @@ class MainWindow(QMainWindow):
 
     # ---- Fermeture ------------------------------------------------------- #
     def closeEvent(self, event):
+        if not self._switched and self.downloads.active and not confirm(
+                self, "Quitter", f"{len(self.downloads.active)} téléchargement(s) en cours ou en attente. Quitter les "
+                "arrête ; relancés plus tard (même film / même saison), ils reprendront là où ils en étaient.",
+                "Quitter quand même", danger=True):
+            event.ignore()
+            return
         for timer in (self.ui_timer, self.watchdog, self.fs_timer, self.next_timer, self.tracks_timer,
                       self.sync_timer):
             timer.stop()
@@ -3051,6 +3560,14 @@ def main() -> int:
             session.sign_out()
             notice = f"Reconnexion nécessaire : {e}."
     cfg = config.load()
+    if session.vault_key is None and not cfg.get("vault_asked"):
+        # PC connecté avant le partage chiffré de l'abonnement : on demande une fois le mot de passe (« Plus tard »
+        # possible : ☰ > Compte du foyer > Activer le partage)
+        ask_vault()
+        cfg = config.load()
+        cfg["vault_asked"] = True
+        config.save_common(cfg, config.current_profile())
+        cfg = config.load()
     if cfg.get("ask_profile", True) and len(cfg["profiles"]) > 1:
         picker = ProfilePicker(cfg["profiles"], config.current_profile())  # « Qui regarde ? »
         picker.exec()

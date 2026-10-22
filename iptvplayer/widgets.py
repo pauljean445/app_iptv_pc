@@ -2,8 +2,9 @@
 fenêtre de connexion et barres flottantes du plein écran."""
 from PySide6.QtCore import (QAbstractListModel, QEasingCurve, QMimeData, QModelIndex, QPoint, QPropertyAnimation,
                             QRect, QSize, Qt, QTimer, Signal)
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -18,6 +19,8 @@ from PySide6.QtWidgets import (
     QListView,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QProgressBar,
     QButtonGroup,
     QRadioButton,
     QSizePolicy,
@@ -431,6 +434,349 @@ def confirm(parent, title: str, text: str, ok: str, danger: bool = False) -> boo
     return dlg.exec() == QDialog.Accepted
 
 
+def inform(parent, title: str, text: str, error: bool = False) -> None:
+    """Message simple au style du menu ☰ (à la place de QMessageBox.information / warning)."""
+    dlg = CardDialog(parent, title)
+    label = dlg.add_text(text)
+    if error:
+        label.setObjectName("notice")
+        label.setProperty("error", True)
+    dlg.add_buttons(("OK", "primary", dlg.accept))
+    dlg.exec()
+
+
+class ItemCardDialog(CardDialog):
+    """Fiche d'un film ou d'une série par-dessus la recherche (Échap ou croix : retour aux résultats).
+    Occupe l'écran de l'appli moins une même marge sur les 4 bords ; la colonne de droite défile.
+    Remplie par la fenêtre principale : set_poster, set_info, set_buttons."""
+
+    MARGIN = 40  # écart avec chaque bord de l'écran (ou de la fenêtre de l'appli si elle est plus petite)
+
+    def __init__(self, parent, title: str):
+        super().__init__(parent, title)
+        area = self._fit(parent)
+        self.setFixedSize(area.size())
+        row = QHBoxLayout()
+        row.setSpacing(28)
+        self.poster = QLabel()
+        self.poster.setObjectName("poster")
+        h = max(300, min(600, area.height() - 110))  # affiche à la hauteur de la fenêtre (titre déduit)
+        self.poster.setFixedSize(h * 2 // 3, h)
+        self.poster.setAlignment(Qt.AlignCenter)
+        row.addWidget(self.poster, 0, Qt.AlignTop)
+        content = QWidget()
+        content.setObjectName("cardContent")
+        col = QVBoxLayout(content)
+        col.setContentsMargins(0, 0, 12, 0)
+        col.setSpacing(10)
+        self.name = QLabel()
+        self.name.setObjectName("detTitle")
+        self.name.setWordWrap(True)
+        self.meta = QLabel()
+        self.meta.setObjectName("detMeta")
+        self.meta.setWordWrap(True)
+        self.meta.setTextFormat(Qt.RichText)
+        self.buttons = QHBoxLayout()
+        self.buttons.setSpacing(10)
+        self.plot = QLabel()
+        self.plot.setObjectName("detPlot")
+        self.plot.setWordWrap(True)
+        self.plot.setTextFormat(Qt.RichText)
+        self.plot.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.tracks = ui.TracksBox()  # langues et sous-titres du fichier, comme sur la fiche des onglets
+        self.credits = QLabel()
+        self.credits.setObjectName("detCredits")
+        self.credits.setWordWrap(True)
+        self.credits.setTextFormat(Qt.RichText)
+        for w in (self.name, self.meta, self.plot, self.credits):
+            w.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        col.addWidget(self.name)
+        col.addWidget(self.meta)
+        col.addLayout(self.buttons)
+        col.addWidget(self.tracks)
+        col.addSpacing(4)
+        col.addWidget(self.plot)
+        col.addWidget(self.credits)
+        col.addStretch(1)
+        # Tout le texte défile ensemble : les langues renvoyées à la ligne gardent toute leur hauteur
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(content)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.verticalScrollBar().setSingleStep(40)
+        self.scroll.setStyleSheet("QScrollArea, QWidget#cardContent { background: transparent; }")
+        row.addWidget(self.scroll, 1)
+        self.body.addLayout(row, 1)
+
+    def _fit(self, parent) -> QRect:
+        """Zone de la fiche : l'écran disponible (limité à la fenêtre de l'appli) moins MARGIN de chaque côté."""
+        win = parent.window() if parent is not None else None
+        screen = (win.screen() if win is not None else None) or QApplication.primaryScreen()
+        host = screen.availableGeometry()
+        if win is not None and win.isVisible():
+            host = host.intersected(win.frameGeometry())
+        m = self.MARGIN
+        return host.adjusted(m, m, -m, -m)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        area = self._fit(self.parent())
+        self.move(area.topLeft())  # même écart avec les 4 bords (la taille est fixée à la création)
+
+    def set_poster(self, pm: QPixmap | None, text: str):
+        if pm is not None:
+            self.poster.setPixmap(pm)
+        else:
+            self.poster.setPixmap(QPixmap())
+            self.poster.setText(text)
+
+    def set_info(self, name: str, meta: str, plot_html: str, credits_html: str):
+        self.name.setText(name)
+        self.meta.setText(meta)
+        self.meta.setVisible(bool(meta))
+        self.plot.setText(plot_html)
+        self.credits.setText(credits_html)
+        self.credits.setVisible(bool(credits_html))
+
+    def set_buttons(self, specs: list) -> list:
+        """specs : (texte, style, action, icône ou None, actif). Retourne les boutons créés."""
+        while self.buttons.count():
+            item = self.buttons.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        made = []
+        for text, style, action, icon_name, enabled in specs:
+            b = QPushButton(text)
+            b.setObjectName(style)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setEnabled(enabled)
+            if icon_name:
+                b.setIcon(ui.icon(icon_name, ui.C["text"]))
+                b.setIconSize(QSize(20, 20))
+            if action is not None:
+                b.clicked.connect(action)
+            self.buttons.addWidget(b)
+            made.append(b)
+        self.buttons.addStretch(1)
+        return made
+
+
+class UpdateDialog(CardDialog):
+    """« Mise à jour disponible » : version, nouveautés (zone défilante), Plus tard / Mettre à jour."""
+
+    def __init__(self, parent, version: str, current: str, notes: str):
+        super().__init__(parent, "Mise à jour disponible", width=520)
+        self.add_text(f"La version <b>{version}</b> est disponible (tu as la {current}).")
+        if notes:
+            box = QFrame()
+            box.setObjectName("drawerGroup")
+            bl = QVBoxLayout(box)
+            bl.setContentsMargins(14, 10, 14, 10)
+            text = QLabel(notes)
+            text.setObjectName("cardNote")
+            text.setWordWrap(True)
+            text.setTextFormat(Qt.PlainText)
+            area = QScrollArea()
+            area.setWidget(text)
+            area.setWidgetResizable(True)
+            area.setFrameShape(QFrame.NoFrame)
+            area.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+            area.setMaximumHeight(200)
+            bl.addWidget(area)
+            self.body.addWidget(box)
+        note = QLabel("L'appli va télécharger la nouvelle version, se fermer puis se relancer d'elle-même. "
+                      "Tes réglages, favoris et reprises de lecture sont conservés.")
+        note.setObjectName("cardNote")
+        note.setWordWrap(True)
+        self.body.addWidget(note)
+        self.add_buttons(("Plus tard", "secondary", self.reject), ("Mettre à jour", "primary", self.accept))
+
+
+class ProgressDialog(CardDialog):
+    """Téléchargement en cours (mise à jour) : texte, barre de progression, Annuler."""
+
+    def __init__(self, parent, title: str, text: str, on_cancel):
+        super().__init__(parent, title, width=480)
+        self.label = self.add_text(text)
+        self.bar = QProgressBar()
+        self.bar.setObjectName("bar")
+        self.bar.setRange(0, 100)
+        self.bar.setTextVisible(False)
+        self.body.addWidget(self.bar)
+        self.detail = QLabel()
+        self.detail.setObjectName("cardNote")
+        self.body.addWidget(self.detail)
+        self._on_cancel = on_cancel
+        self.add_buttons(("Annuler", "secondary", self._cancel))
+
+    def set_progress(self, got: int, total: int):
+        if total:
+            self.bar.setValue(int(got * 100 / total))
+            self.detail.setText(f"{got / 1_048_576:.0f} Mo sur {total / 1_048_576:.0f} Mo")
+
+    def _cancel(self):
+        self._on_cancel()
+        self.reject()
+
+    def reject(self):  # Échap et croix : comme « Annuler »
+        self._on_cancel()
+        super().reject()
+
+
+class DownloadsDialog(CardDialog):
+    """Téléchargements : file d'attente (progression, annuler, réessayer), dossier de destination."""
+
+    def __init__(self, parent, manager, folder: str, on_change_folder):
+        super().__init__(parent, "Téléchargements", width=620)
+        self.manager = manager
+        self._on_change_folder = on_change_folder
+        self.folder = QLabel()
+        self.folder.setObjectName("cardText")
+        self.folder.setWordWrap(True)
+        row = QHBoxLayout()
+        row.addWidget(self.folder, 1)
+        change = QPushButton("Changer…")
+        change.setObjectName("secondary")
+        change.setCursor(Qt.PointingHandCursor)
+        change.clicked.connect(self._change_folder)
+        opener = QPushButton("Ouvrir")
+        opener.setObjectName("secondary")
+        opener.setCursor(Qt.PointingHandCursor)
+        opener.clicked.connect(lambda: _open_folder(self._folder))
+        row.addWidget(opener)
+        row.addWidget(change)
+        self.body.addLayout(row)
+        self.list = QVBoxLayout()
+        self.list.setSpacing(6)
+        box = QWidget()
+        box.setLayout(self.list)
+        area = QScrollArea()
+        area.setWidget(box)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        area.setMinimumHeight(260)
+        self.body.addWidget(area)
+        note = QLabel("Un fichier à la fois : chaque téléchargement utilise une connexion de ton abonnement IPTV "
+                      "(si ton abonnement n'en permet qu'une, la lecture peut être refusée pendant ce temps). "
+                      "Un téléchargement interrompu reprend là où il en était.")
+        note.setObjectName("cardNote")
+        note.setWordWrap(True)
+        self.body.addWidget(note)
+        self.add_buttons(("Effacer les terminés", "secondary", manager.clear_finished),
+                         ("Tout annuler", "secondary", manager.cancel_all), ("Fermer", "primary", self.accept))
+        self._folder = folder
+        self._rows: dict = {}
+        manager.changed.connect(self.refresh)
+        self.refresh()
+
+    def _change_folder(self):
+        folder = self._on_change_folder(self)
+        if folder:
+            self._folder = folder
+            self.refresh()
+
+    def refresh(self):
+        self.folder.setText(f"<span style='color:{ui.C['muted']}'>Dossier :</span> {self._folder}")
+        jobs = list(self.manager.jobs)
+        for job in list(self._rows):
+            if job not in jobs:
+                self._rows.pop(job).deleteLater()
+        if not jobs and not self._rows:
+            while self.list.count():
+                item = self.list.takeAt(0)
+                if item.widget() is not None:
+                    item.widget().deleteLater()
+            empty = QLabel("Aucun téléchargement. Bouton ⬇ sur la fiche d'un film ou d'une série.")
+            empty.setObjectName("cardNote")
+            self.list.addWidget(empty)
+            self._rows[None] = empty
+            return
+        if None in self._rows and jobs:
+            self._rows.pop(None).deleteLater()
+        for job in jobs:
+            row = self._rows.get(job)
+            if row is None:
+                row = _JobRow(job, self.manager)
+                self._rows[job] = row
+                self.list.addWidget(row)
+            row.update_state()
+
+    def done(self, result):
+        try:
+            self.manager.changed.disconnect(self.refresh)
+        except (RuntimeError, TypeError):
+            pass
+        super().done(result)
+
+
+class _JobRow(QFrame):
+    def __init__(self, job, manager):
+        super().__init__()
+        self.job, self.manager = job, manager
+        self.setObjectName("drawerGroup")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 8, 8, 8)
+        lay.setSpacing(5)
+        top = QHBoxLayout()
+        self.title = QLabel(job.title)
+        self.title.setObjectName("cardText")
+        self.title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.action = QPushButton()
+        self.action.setObjectName("drawerRow")
+        self.action.setCursor(Qt.PointingHandCursor)
+        self.action.clicked.connect(self._act)
+        top.addWidget(self.title, 1)
+        top.addWidget(self.action)
+        lay.addLayout(top)
+        self.bar = QProgressBar()
+        self.bar.setObjectName("bar")
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        lay.addWidget(self.bar)
+        self.state = QLabel()
+        self.state.setObjectName("cardNote")
+        lay.addWidget(self.state)
+
+    def update_state(self):
+        j = self.job
+        mb = j.done / 1_048_576
+        size = f"{mb:.0f} / {j.total / 1_048_576:.0f} Mo" if j.total else f"{mb:.0f} Mo"
+        texts = {
+            "waiting": "En attente",
+            "running": f"{int(j.progress * 100)} %  ·  {size}  ·  {j.speed / 1_048_576:.1f} Mo/s" if j.total
+            else f"{size}  ·  {j.speed / 1_048_576:.1f} Mo/s",
+            "done": f"Terminé  ·  {size}",
+            "error": f"Échec : {j.error}",
+            "cancelled": "Annulé",
+        }
+        self.state.setText(texts[j.state])
+        self.bar.setVisible(j.state in ("running", "waiting"))
+        self.bar.setValue(int(j.progress * 1000))
+        self.action.setText({"waiting": "Annuler", "running": "Annuler", "done": "Afficher",
+                             "error": "Réessayer", "cancelled": "Réessayer"}[j.state])
+
+    def _act(self):
+        j = self.job
+        if j.state in ("waiting", "running"):
+            self.manager.cancel(j)
+        elif j.state == "done":
+            _open_folder(str(j.dest.parent), select=str(j.dest))
+        else:
+            self.manager.retry(j)
+
+
+def _open_folder(folder: str, select: str = ""):
+    """Ouvre le dossier dans l'Explorateur (en sélectionnant le fichier si donné)."""
+    import os
+    import subprocess
+    if select and os.name == "nt":
+        subprocess.Popen(["explorer", "/select,", os.path.normpath(select)])
+    elif os.name == "nt":
+        os.startfile(folder)  # noqa: S606 (dossier choisi par l'utilisateur)
+
+
 class AccountDialog(CardDialog):
     """Compte du foyer : connexion (email, mot de passe) ou, si ce PC est connecté, déconnexion.
 
@@ -438,7 +784,8 @@ class AccountDialog(CardDialog):
     arrière-plan) ; sign_out() déconnecte ce PC. Le compte est obligatoire : sans connexion, on quitte.
     """
 
-    def __init__(self, parent, email: str, signed_in: bool, sign_in, sign_out, notice: str = ""):
+    def __init__(self, parent, email: str, signed_in: bool, sign_in, sign_out, notice: str = "",
+                 vault_active: bool = True, on_vault=None, intro: str = "", cancel_label: str = "Quitter"):
         super().__init__(parent, "Compte du foyer")
         self._sign_in, self._sign_out = sign_in, sign_out
         if signed_in:
@@ -456,11 +803,24 @@ class AccountDialog(CardDialog):
             self.body.addWidget(box)
             self.add_text("Les profils, favoris, reprises de lecture et choix de langue sont partagés avec les "
                           "autres appareils du foyer.")
-            self.add_buttons(("Se déconnecter", "secondary", self._on_sign_out), ("Fermer", "primary", self.reject))
+            vault_note = QLabel(
+                "Abonnement IPTV : partagé, chiffré, pour configurer tes nouveaux appareils (chacun garde le sien)."
+                if vault_active else
+                "Abonnement IPTV : pas encore partagé. Saisis une fois le mot de passe du compte pour qu'il serve, "
+                "chiffré, à configurer tes nouveaux appareils (nouvelle TV, nouveau PC).")
+            vault_note.setObjectName("cardNote")
+            vault_note.setWordWrap(True)
+            self.body.addWidget(vault_note)
+            buttons = [("Se déconnecter", "secondary", self._on_sign_out)]
+            if not vault_active and on_vault is not None:
+                buttons.append(("Activer le partage", "secondary", lambda: (self.reject(), on_vault())))
+            self.add_buttons(*buttons, ("Fermer", "primary", self.reject))
             return
-        self.add_text("Connecte-toi au compte de ton foyer pour utiliser l'appli. Les profils, favoris, reprises "
-                      "de lecture et choix de langue sont partagés avec la TV et les autres PC.")
+        self.add_text(intro or "Connecte-toi au compte de ton foyer pour utiliser l'appli. Les profils, favoris, "
+                      "reprises de lecture et choix de langue sont partagés avec la TV et les autres PC.")
         self.email = self._field("EMAIL", email, "adresse email du compte")
+        if intro:  # demande du mot de passe seulement (même compte)
+            self.email.setReadOnly(True)
         self.password = self._field("MOT DE PASSE", "", "")
         self.password.setEchoMode(QLineEdit.Password)
         self.status = QLabel()
@@ -473,8 +833,8 @@ class AccountDialog(CardDialog):
         note.setObjectName("cardNote")
         note.setWordWrap(True)
         self.body.addWidget(note)
-        _, self.ok = self.add_buttons(("Quitter", "secondary", self.reject),
-                                      ("Se connecter", "primary", self._on_sign_in))
+        _, self.ok = self.add_buttons((cancel_label, "secondary", self.reject),
+                                      ("Valider" if intro else "Se connecter", "primary", self._on_sign_in))
         (self.password if email else self.email).setFocus()
         if notice:
             self._show(notice, error=True)

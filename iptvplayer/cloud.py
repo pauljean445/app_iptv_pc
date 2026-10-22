@@ -3,8 +3,9 @@
 Seule la clé publique du projet est dans le code : ce qu'un compte peut lire ou écrire est fixé par les
 règles de la base (chaque foyer n'accède qu'à households/<son uid>, et seulement les comptes autorisés).
 La clé admin, qui passe outre ces règles, n'est jamais utilisée.
-Sur ce PC, account.json garde l'email, l'uid et le jeton de renouvellement de la session, chiffré par
-Windows (DPAPI : lisible seulement par cet utilisateur Windows). Le mot de passe n'est jamais enregistré.
+Sur ce PC, account.json garde l'email, l'uid, le jeton de renouvellement de la session et la clé de chiffrement
+de la source IPTV (vault.py), chiffrés par Windows (DPAPI : lisibles seulement par cet utilisateur Windows).
+Le mot de passe n'est jamais enregistré.
 L'appli appelle le serveur ; le serveur n'a aucun moyen de joindre le PC.
 """
 import base64
@@ -190,6 +191,10 @@ class Session:
             self._refresh = _unseal(data["token"]) if data.get("token") else ""
         except (OSError, ValueError, UnicodeDecodeError):
             self._refresh = ""  # jeton illisible (autre utilisateur Windows…) : il faudra se reconnecter
+        try:  # clé de chiffrement de la source IPTV (calculée à la connexion, à partir du mot de passe)
+            self.vault_key: bytes | None = base64.b64decode(_unseal(data["vault"])) if data.get("vault") else None
+        except (OSError, ValueError, UnicodeDecodeError):
+            self.vault_key = None
         self._id_token, self._expires = "", 0.0
         self._lock = threading.Lock()
 
@@ -198,8 +203,9 @@ class Session:
         return bool(self.uid and self._refresh)
 
     def _store(self) -> None:
-        config.save_json(ACCOUNT_FILE, {"email": self.email, "uid": self.uid,
-                                        "token": _seal(self._refresh) if self._refresh else ""})
+        config.save_json(ACCOUNT_FILE, {
+            "email": self.email, "uid": self.uid, "token": _seal(self._refresh) if self._refresh else "",
+            "vault": _seal(base64.b64encode(self.vault_key).decode()) if self.vault_key else ""})
 
     def sign_in(self, email: str, password: str) -> None:
         """Connexion (réseau, à lancer hors de l'interface). Vérifie aussi que le compte a accès à la base."""
@@ -209,6 +215,8 @@ class Session:
             self.email, self.uid = r.get("email") or email, r["localId"]
             self._refresh = r["refreshToken"]
             self._id_token, self._expires = r["idToken"], time.time() + int(r.get("expiresIn", 3600))
+        from . import vault
+        self.vault_key = vault.derive_key(password, self.uid)
         try:
             self.get_doc("")  # document du foyer : absent (None) au début, mais lisible si le compte est autorisé
         except Forbidden:
@@ -221,6 +229,7 @@ class Session:
         with self._lock:
             self.uid = self._refresh = self._id_token = ""
             self._expires = 0.0
+            self.vault_key = None
         self._store()
 
     def _token(self) -> str:

@@ -34,7 +34,7 @@ DEFAULTS = {
 
 # Réglages propres à chaque profil sur cet appareil ; tous les autres sont communs
 PROFILE_KEYS = ("mode", "server", "username", "password", "stream_format", "url", "file", "remember",
-                "last_key", "last_tab", "series_keywords", "cast_compat")
+                "source_t", "last_key", "last_tab", "series_keywords", "cast_compat")
 SOURCE_KEYS = ("mode", "server", "username", "password", "stream_format", "url", "file", "remember")
 PROFILE_COLORS = ("#7B66FF", "#FF5470", "#2EC4B6", "#FFB020", "#3A86FF", "#8AC926")
 PROFILE_FILES = ("library.json", "catalog.bin")  # données d'un profil (avant les profils : à la racine)

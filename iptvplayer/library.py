@@ -20,7 +20,8 @@ VERSION = 2
 # recent   : clé film / série -> {"kind", "name", "t", "last_ep", "last_label", "total"}
 # watched  : clé épisode vu -> {"s": clé de la série, "t"}
 # prefs    : clé film / série -> {"audio", "spu", "t"}    (langue et sous-titres choisis)
-TABLES = ("fav", "progress", "recent", "watched", "prefs")
+# hidden   : "onglet|catégorie" -> {"t"}                  (catégories masquées, rangées dans « Autres »)
+TABLES = ("fav", "progress", "recent", "watched", "prefs", "hidden")
 
 
 def is_finished(pos: int, length: int) -> bool:
@@ -52,7 +53,7 @@ class Library:
         self.tables: dict[str, dict] = {name: data.get(name) or {} for name in TABLES}
         deleted = data.get("deleted") or {}
         self.deleted: dict[str, dict] = {name: deleted.get(name) or {} for name in TABLES}
-        self.fav, self.progress, self.recent, self.watched, self.prefs = (self.tables[n] for n in TABLES)
+        self.fav, self.progress, self.recent, self.watched, self.prefs, self.hidden = (self.tables[n] for n in TABLES)
         # Langues mémorisées avant la synchronisation (déplacées de profile.json par config)
         for key, pref in (data.get("track_prefs") or {}).items():
             if key not in self.prefs:
@@ -166,13 +167,17 @@ class Library:
         self._drop("watched", episode.key)
 
     def update(self, item, pos: int, length: int, finished: bool) -> None:
-        """Enregistre l'avancement d'un film ou d'un épisode."""
+        """Enregistre l'avancement d'un film ou d'un épisode. Dès que l'image a démarré (pos > 0), le film /
+        la série entre dans « Vu récemment » ; la position de reprise n'est gardée qu'à partir de MIN_RESUME_MS."""
+        if not finished and pos <= 0:
+            return
         if item.kind == "movie":
             if finished:
                 self._drop("progress", item.key)
                 self._drop("recent", item.key)
-            elif pos >= MIN_RESUME_MS:
-                self._put("progress", item.key, {"pos": pos, "len": length})
+            else:
+                if pos >= MIN_RESUME_MS:
+                    self._put("progress", item.key, {"pos": pos, "len": length})
                 self._put("recent", item.key, {"kind": "movie", "name": item.name})
         elif item.kind == "episode" and item.parent is not None:
             show = item.parent
@@ -182,8 +187,6 @@ class Library:
                     self._put("watched", item.key, {"s": show.key})
             elif pos >= MIN_RESUME_MS:
                 self._put("progress", item.key, {"pos": pos, "len": length})
-            elif show.key not in self.recent:
-                return
             label = f"S{item.season:02d}E{item.episode:02d}" if (item.season or item.episode) else item.name
             entry = dict(self.recent.get(show.key) or {"kind": "series"})
             entry.update(last_ep=item.key, last_label=label, name=show.name)
@@ -210,6 +213,17 @@ class Library:
             self._drop("progress", k)
         for k in self.watched_keys(key):
             self._drop("watched", k)
+        self.save()
+
+    # ---- Catégories masquées (par onglet), rangées dans « Autres » ---------- #
+    def is_hidden(self, tab: str, group: str) -> bool:
+        return f"{tab}|{group}" in self.hidden
+
+    def set_hidden(self, tab: str, group: str, hide: bool) -> None:
+        if hide:
+            self._put("hidden", f"{tab}|{group}", {})
+        else:
+            self._drop("hidden", f"{tab}|{group}")
         self.save()
 
     # ---- Langue et sous-titres mémorisés (par film ou par série) ----------- #

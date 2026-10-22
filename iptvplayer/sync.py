@@ -7,12 +7,14 @@ Pour chaque entrée, la version la plus récente (« t ») gagne, que ce soit un
 suppression. Une synchro : lire le document, appliquer ici ce que le serveur a de plus récent, puis envoyer
 seulement ce que ce PC a de plus récent, champ par champ. Serveur injoignable : l'appli continue avec ses
 données, et ce qui est plus récent ici est renvoyé au passage suivant (rien n'est perdu).
-La source IPTV et les autres réglages de profile.json restent propres à chaque appareil.
+La source IPTV du profil voyage chiffrée (champ secret.source = {"v": bloc vault.py, "t"}, voir source_writes) ;
+les autres réglages de profile.json restent propres à chaque appareil.
 """
 import shutil
 import time
 
-from . import cloud, config, library
+from . import cloud, config, library, vault
+from .sources import playlist
 
 PURGE_SECONDS = library.PURGE_DAYS * 86400
 
@@ -73,9 +75,67 @@ def library_writes(lib: library.Library, remote: dict | None, pid: str) -> tuple
 
 def sync_library_now(session: cloud.Session, lib: library.Library, pid: str, timeout: int = 8) -> bool:
     """Synchro complète d'un profil, sans attendre le passage suivant (fermeture, changement de profil)."""
-    changed, writes = library_writes(lib, session.get_doc(f"profiles/{pid}", timeout), pid)
+    return sync_profile_now(session, lib, pid, None, timeout)[0]
+
+
+def sync_profile_now(session: cloud.Session, lib: library.Library, pid: str, own: dict | None,
+                     timeout: int = 8) -> tuple[bool, bool, bool]:
+    """Comme sync_library_now, avec la source IPTV du profil si own (ses réglages) est donné.
+    Retourne (données changées, source adoptée, own modifié : à enregistrer)."""
+    remote = session.get_doc(f"profiles/{pid}", timeout)
+    changed, writes = library_writes(lib, remote, pid)
+    adopted = modified = False
+    if own is not None:
+        adopted, modified, fields = source_writes(pid, own, remote, session.vault_key)
+        writes = with_fields(writes, pid, fields)
     session.commit(writes, timeout)
-    return changed
+    return changed, adopted, modified
+
+
+# ---- Source IPTV du profil (chiffrée) ------------------------------------- #
+def source_writes(pid: str, own: dict, remote: dict | None, key: bytes | None) -> tuple[bool, bool, dict]:
+    """Source IPTV du profil (même règle que Sync.sourceWrites côté TV). Le compte sert à configurer les appareils
+    qui n'en ont pas : un profil SANS abonnement ici prend celui du compte (déchiffré dans own). Un profil qui en a
+    un le garde toujours (chaque appareil peut avoir le sien, ex. un lien « TV » différent de celui du PC) ; il
+    l'envoie au compte s'il n'y en a pas, s'il y est indéchiffrable (mot de passe changé) ou après un changement
+    fait ici (source_t plus récent). Rien si l'utilisateur ne veut pas d'identifiants enregistrés (remember) ou
+    pour un fichier M3U local. own (réglages du profil) est modifié sur place.
+    Retourne (source adoptée, own modifié, champs à écrire)."""
+    if key is None or own.get("remember") is False:
+        return False, False, {}
+    lt = float(own.get("source_t") or 0)
+    r = ((remote or {}).get("secret") or {}).get("source")
+    r = r if isinstance(r, dict) else None
+    rt = float(r.get("t") or 0) if r else 0.0
+    data = vault.decrypt(key, pid, str(r.get("v", ""))) if r else None
+    if playlist.source_from_config(own) is None:
+        if data is None:
+            return False, False, {}
+        for k in vault.KEYS:
+            own[k] = data.get(k) or ""
+        own["remember"] = True
+        own["source_t"] = rt
+        return True, True, {}
+    if own.get("mode") == "file":
+        return False, False, {}  # fichier de ce PC : sans objet ailleurs
+    if r is None or data is None or lt > rt:
+        t = lt if (r is None or lt > rt) else time.time()
+        modified = t != lt
+        own["source_t"] = t
+        blob = vault.encrypt(key, pid, {k: own.get(k) or "" for k in vault.KEYS})
+        return False, modified, {cloud.field_path("secret", "source"): {"v": blob, "t": t}}
+    return False, False, {}
+
+
+def with_fields(writes: list, pid: str, fields: dict) -> list:
+    """Ajoute des champs à l'écriture du document du profil (ou en crée une)."""
+    if not fields:
+        return writes
+    path = f"profiles/{pid}"
+    for i, (p, f, d) in enumerate(writes):
+        if p == path and f is not None:
+            return writes[:i] + [(p, {**f, **fields}, d)] + writes[i + 1:]
+    return writes + [(path, fields, ())]
 
 
 # ---- Liste des profils ---------------------------------------------------- #
@@ -135,7 +195,15 @@ def startup(session: cloud.Session) -> None:
         if fresh and not added:
             # Premier passage de ce compte sur ce PC, foyer encore vide : on envoie aussi les données des profils
             for pid in ids:
-                sync_library_now(session, library.Library(config.profile_dir(pid)), pid)
+                own = config.read_profile(pid)
+                if sync_profile_now(session, library.Library(config.profile_dir(pid)), pid, own)[2]:
+                    config.write_profile(pid, own)
+        # Profils sans abonnement sur ce PC (nouvel appareil, profil créé ailleurs) : celui du compte, déchiffré
+        for pid in ids:
+            own = config.read_profile(pid)
+            if session.vault_key and playlist.source_from_config(own) is None:
+                if source_writes(pid, own, session.get_doc(f"profiles/{pid}", timeout=8), session.vault_key)[1]:
+                    config.write_profile(pid, own)
     except cloud.Forbidden:
         session.sign_out()  # compte retiré des comptes autorisés
         raise cloud.AuthError("l'accès de ce compte a été retiré")

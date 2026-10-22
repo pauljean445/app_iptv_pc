@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLayout,
+    QLineEdit,
     QListView,
     QMenu,
     QPushButton,
@@ -124,6 +125,8 @@ QPushButton#primary:disabled {{ background: {C['surface2']}; color: {C['muted']}
 QPushButton#danger {{ background: {C['live']}; color: white; border: none; border-radius: 9px;
     padding: 10px 20px; font-size: 11pt; font-weight: 600; }}
 QPushButton#danger:hover {{ background: #FF7590; }}
+QProgressBar#bar {{ background: {C['surface2']}; border: none; border-radius: 4px; max-height: 8px; min-height: 8px; }}
+QProgressBar#bar::chunk {{ background: {C['accent_hi']}; border-radius: 4px; }}
 #trackTitle {{ color: {C['muted']}; font-size: 10pt; font-weight: 600; padding-top: 7px; }}
 QPushButton#langChip, QPushButton#subChip {{ background: {C['surface2']}; color: {C['text']};
     border: 1px solid {C['line']}; border-radius: 15px; padding: 6px 14px; font-size: 10pt; }}
@@ -135,6 +138,9 @@ QPushButton#subChip:checked {{ background: {C['accent']}; border-color: {C['acce
 /* ---- Listes (chaînes, films, séries…) ---- */
 #browseLeft {{ background: {C['panel']}; }}
 QListView#itemList {{ background: {C['panel']}; border: none; outline: 0; }}
+QLineEdit#bigSearch {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['line']};
+    border-radius: 12px; padding: 12px 16px; font-size: 13pt; selection-background-color: {C['accent']}; }}
+QLineEdit#bigSearch:focus {{ border-color: {C['accent']}; }}
 QLineEdit#search, QComboBox#groups {{ background: {C['bg']}; color: {C['text']}; border: 1px solid {C['line']};
     border-radius: 9px; padding: 7px 11px; font-size: 10.5pt; selection-background-color: {C['accent']}; }}
 QLineEdit#search:focus, QComboBox#groups:focus, QComboBox#groups:on {{ border-color: {C['accent']}; }}
@@ -309,6 +315,7 @@ _GRID24 = {
                                     [(6, 7), (7, 20), (17, 20), (18, 7)]),
     "add_profile": lambda p, c: (_g24_dashed_circle(p, c), _g24_poly(p, c, [(12, 8), (12, 16)], [(8, 12), (16, 12)])),
     "account": lambda p, c: (_g24_arc(p, c, 12, 8, 4, 0, 360), _g24_arc(p, c, 12, 21, 7.5, 0, 180)),
+    "search": lambda p, c: (_g24_arc(p, c, 10.5, 10.5, 6.5, 0, 360), _g24_poly(p, c, [(15.5, 15.5), (20, 20)])),
 }
 
 
@@ -939,6 +946,55 @@ class HomeSection(QFrame):
         self._update_arrows()
 
 
+class SearchPage(QScrollArea):
+    """Recherche : un grand champ, puis une bande de films et une bande de séries (même style que l'accueil)."""
+
+    tileClicked = Signal(str, object)
+    openTab = Signal(str)
+
+    def __init__(self, images):
+        super().__init__()
+        self.setObjectName("homeScroll")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.verticalScrollBar().setSingleStep(40)
+        content = QWidget()
+        content.setObjectName("home")
+        content.setAttribute(Qt.WA_StyledBackground, True)
+        self.setWidget(content)
+        col = QVBoxLayout(content)
+        col.setContentsMargins(16, 16, 16, 16)
+        col.setSpacing(12)
+        self.field = QLineEdit()
+        self.field.setObjectName("bigSearch")
+        self.field.setPlaceholderText("Rechercher un film ou une série…")
+        self.field.setClearButtonEnabled(True)
+        self.field.setMaximumWidth(720)
+        self.hint = QLabel()
+        self.hint.setObjectName("sectionSub")
+        col.addWidget(self.field)
+        col.addWidget(self.hint)
+        self.sections: dict[str, HomeSection] = {}
+        for kind, title in (("movie", "Films"), ("series", "Séries")):
+            sec = HomeSection(kind, title, "Résultats", images, True, "")
+            sec.tileClicked.connect(self.tileClicked)
+            sec.openTab.connect(self.openTab)
+            self.sections[kind] = sec
+            col.addWidget(sec)
+        col.addStretch(1)
+
+    def set_results(self, films: list | None, series: list | None, hint: str):
+        """films / series : tuiles (None = rien à chercher : bandes masquées)."""
+        self.hint.setText(hint)
+        for kind, tiles, empty in (("movie", films, "Aucun film trouvé."), ("series", series, "Aucune série trouvée.")):
+            sec = self.sections[kind]
+            sec.setVisible(tiles is not None)
+            if tiles is not None:
+                sec.set_tiles(tiles, empty)
+                sec.mosaic.horizontalScrollBar().setValue(0)
+
+
 class HomePage(QScrollArea):
     """Accueil : une bande horizontale par onglet, empilées ; la page défile si l'écran est trop petit."""
 
@@ -1027,7 +1083,11 @@ class DetailsPage(QScrollArea):
         self.alt_btn.setObjectName("secondary")
         self.fav_btn = QPushButton()
         self.fav_btn.setObjectName("secondary")
-        for b in (self.play_btn, self.alt_btn, self.fav_btn):
+        self.dl_btn = QPushButton()  # téléchargement sur le disque (film, épisode, saison d'une série)
+        self.dl_btn.setObjectName("secondary")
+        self.dl_btn.setIcon(icon("download", C["text"]))
+        self.dl_btn.setIconSize(QSize(20, 20))
+        for b in (self.play_btn, self.alt_btn, self.fav_btn, self.dl_btn):
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
             btns.addWidget(b)
@@ -1047,26 +1107,8 @@ class DetailsPage(QScrollArea):
         self.credits.setMaximumWidth(820)
 
         # Langues et sous-titres du fichier : un bouton par langue lance la lecture dans cette langue
-        self.tracks = QWidget()
-        tg = QGridLayout(self.tracks)
-        tg.setContentsMargins(0, 4, 0, 0)
-        tg.setHorizontalSpacing(14)
-        tg.setVerticalSpacing(10)
-        self.tracks_msg = QLabel()
-        self.tracks_msg.setObjectName("detCredits")
-        self.audio_title, self.sub_title = QLabel("Langue"), QLabel("Sous-titres")
-        self.audio_flow, self.sub_flow = FlowLayout(), FlowLayout()
-        for r, (lbl, flow) in enumerate(((self.audio_title, self.audio_flow), (self.sub_title, self.sub_flow))):
-            lbl.setObjectName("trackTitle")
-            box = QWidget()
-            box.setLayout(flow)
-            box.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-            tg.addWidget(lbl, r, 0, Qt.AlignLeft | Qt.AlignTop)
-            tg.addWidget(box, r, 1)
-        tg.addWidget(self.tracks_msg, 2, 0, 1, 2)
-        tg.setColumnStretch(1, 1)
+        self.tracks = TracksBox()
         self.tracks.setMaximumWidth(820)
-        self.tracks.hide()
 
         col.addWidget(self.title)
         col.addWidget(self.meta)
@@ -1083,6 +1125,39 @@ class DetailsPage(QScrollArea):
 
     # ---- Langues / sous-titres ---------------------------------------------- #
     def set_tracks_message(self, text: str):
+        self.tracks.set_message(text)
+
+    def set_tracks(self, audio: list, subs: list, note: str = ""):
+        self.tracks.set_entries(audio, subs, note)
+
+
+class TracksBox(QWidget):
+    """Langues et sous-titres d'un fichier : un bouton par piste (fiche des onglets, fiche de la recherche).
+    Les boutons de langue lancent la lecture, ceux des sous-titres règlent seulement le choix (mémorisé)."""
+
+    def __init__(self):
+        super().__init__()
+        tg = QGridLayout(self)
+        tg.setContentsMargins(0, 4, 0, 0)
+        tg.setHorizontalSpacing(14)
+        tg.setVerticalSpacing(10)
+        self.tracks_msg = QLabel()
+        self.tracks_msg.setObjectName("detCredits")
+        self.tracks_msg.setWordWrap(True)
+        self.audio_title, self.sub_title = QLabel("Langue"), QLabel("Sous-titres")
+        self.audio_flow, self.sub_flow = FlowLayout(), FlowLayout()
+        for r, (lbl, flow) in enumerate(((self.audio_title, self.audio_flow), (self.sub_title, self.sub_flow))):
+            lbl.setObjectName("trackTitle")
+            box = QWidget()
+            box.setLayout(flow)
+            box.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            tg.addWidget(lbl, r, 0, Qt.AlignLeft | Qt.AlignTop)
+            tg.addWidget(box, r, 1)
+        tg.addWidget(self.tracks_msg, 2, 0, 1, 2)
+        tg.setColumnStretch(1, 1)
+        self.hide()
+
+    def set_message(self, text: str):
         """Message seul (recherche en cours, rien trouvé…) ; texte vide = section masquée."""
         for flow in (self.audio_flow, self.sub_flow):
             flow.clear()
@@ -1090,11 +1165,10 @@ class DetailsPage(QScrollArea):
             w.hide()
         self.tracks_msg.setText(text)
         self.tracks_msg.setVisible(bool(text))
-        self.tracks.setVisible(bool(text))
+        self.setVisible(bool(text))
 
-    def set_tracks(self, audio: list, subs: list, note: str = ""):
-        """audio / subs : [(libellé, choisi, infobulle, action)]. Les boutons de langue lancent la lecture,
-        ceux des sous-titres règlent seulement le choix (mémorisé)."""
+    def set_entries(self, audio: list, subs: list, note: str = ""):
+        """audio / subs : [(libellé, choisi, infobulle, action)]."""
         for flow, title, entries, launch in ((self.audio_flow, self.audio_title, audio, True),
                                              (self.sub_flow, self.sub_title, subs, False)):
             flow.clear()
@@ -1111,7 +1185,7 @@ class DetailsPage(QScrollArea):
                 flow.addWidget(b)
         self.tracks_msg.setText(note)
         self.tracks_msg.setVisible(bool(note))
-        self.tracks.setVisible(bool(audio or subs or note))
+        self.setVisible(bool(audio or subs or note))
 
 
 class FlowLayout(QLayout):

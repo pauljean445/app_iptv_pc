@@ -52,10 +52,32 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 ; Mise a jour lancee depuis l'appli (installeur silencieux avec /relaunch=1) : on relance l'appli a la fin.
-Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: RelaunchAfterUpdate
+; --updated : l'appli relancee passe au premier plan et signale la mise a jour installee.
+Filename: "{app}\{#AppExe}"; Parameters: "--updated"; Flags: nowait runasoriginaluser; Check: RelaunchAfterUpdate
 
 [Code]
-function RelaunchAfterUpdate: Boolean;
+function AllowSetForegroundWindow(dwProcessId: Cardinal): Boolean;
+  external 'AllowSetForegroundWindow@user32.dll stdcall';
+
+function IsRelaunch: Boolean;
 begin
   Result := ExpandConstant('{param:relaunch|0}') = '1';
+end;
+
+function RelaunchAfterUpdate: Boolean;
+begin
+  Result := IsRelaunch;
+  { ASFW_ANY : sans cela, Windows ouvre l'appli relancee derriere les autres fenetres }
+  if Result then
+    AllowSetForegroundWindow($FFFFFFFF);
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  { Fenetre de progression de la mise a jour : on previent que l'appli va revenir toute seule }
+  if (CurPageID = wpInstalling) and IsRelaunch then
+  begin
+    WizardForm.PageNameLabel.Caption := 'Mise '#224' jour d''IPTV Player';
+    WizardForm.PageDescriptionLabel.Caption := 'Installation de la nouvelle version. L''appli se rouvrira toute seule dans quelques secondes.';
+  end;
 end;

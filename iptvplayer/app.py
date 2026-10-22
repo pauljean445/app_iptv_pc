@@ -1,4 +1,5 @@
 """Fenêtre principale et démarrage d'IPTV Player (interface PySide6, lecture libVLC). Lancé par main.py."""
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -53,6 +54,7 @@ if sys.platform.startswith("linux"):
 
 from PySide6.QtCore import QEvent, QObject, QPersistentModelIndex, QSize, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QFont, QIcon, QKeySequence, QPixmap
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -168,6 +170,77 @@ def _emit(callback, value):
         _bridge.result.emit(callback, value)
     except RuntimeError:  # fenêtre fermée pendant la tâche : résultat ignoré
         pass
+
+
+UPDATED = "--updated" in sys.argv  # relancée par l'installeur après une mise à jour (installer/IPTVPlayer.iss)
+_update_notice = UPDATED           # « Mise à jour installée » affiché une fois, dans la première fenêtre principale
+_instance_server = None
+
+
+def _bring_to_front(w: QWidget):
+    """Fenêtre devant les autres. Windows refuse souvent le premier plan à une appli lancée en arrière-plan
+    (relance par l'installeur) : passer un instant « toujours au-dessus » la remonte quand même."""
+    if w.isMinimized():
+        w.setWindowState(w.windowState() & ~Qt.WindowMinimized)
+    w.raise_()
+    w.activateWindow()
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND] + [ctypes.c_int] * 4 + [wintypes.UINT]
+            u.SetForegroundWindow.argtypes = [wintypes.HWND]
+            hwnd, flags = int(w.winId()), 0x0001 | 0x0002 | 0x0040  # SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW
+            u.SetWindowPos(hwnd, -1, 0, 0, 0, 0, flags)  # HWND_TOPMOST…
+            u.SetWindowPos(hwnd, -2, 0, 0, 0, 0, flags)  # … puis HWND_NOTOPMOST : reste devant, sans rester épinglée
+            u.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+
+class _FrontOnShow(QObject):
+    """Après une mise à jour : chaque fenêtre ouverte au démarrage (compte, « Qui regarde ? », fenêtre principale)
+    passe devant les autres."""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Show and isinstance(obj, QWidget) and obj.isWindow() \
+                and obj.windowType() in (Qt.Window, Qt.Dialog):
+            QTimer.singleShot(0, lambda w=obj: _bring_to_front(w))
+        return False
+
+
+def _already_running(app) -> bool:
+    """Une seule appli à la fois par dossier de données. Si elle tourne déjà (rouverte à la main pendant la relance
+    après mise à jour, double-clic en trop…), on lui demande de passer devant et on s'arrête."""
+    global _instance_server
+    name = "IPTVPlayer-" + hashlib.sha1(str(config.config_dir()).lower().encode()).hexdigest()[:12]
+    sock = QLocalSocket()
+    sock.connectToServer(name)
+    if sock.waitForConnected(500):
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY : l'autre appli peut passer devant
+            except Exception:
+                pass
+        sock.write(b"show")
+        sock.waitForBytesWritten(500)
+        sock.disconnectFromServer()
+        return True
+    QLocalServer.removeServer(name)  # reste d'une appli arrêtée brutalement (hors Windows)
+    _instance_server = QLocalServer(app)
+
+    def show():
+        while _instance_server.hasPendingConnections():
+            _instance_server.nextPendingConnection().deleteLater()
+        w = QApplication.activeModalWidget() or _main_window
+        if w is not None:
+            _bring_to_front(w)
+
+    _instance_server.newConnection.connect(show)
+    _instance_server.listen(name)
+    return False
 
 
 def ask_account(parent=None, notice: str = "") -> bool:
@@ -1247,6 +1320,10 @@ class MainWindow(QMainWindow):
 
     # ---- Connexion / chargement ------------------------------------------ #
     def _startup(self):
+        global _update_notice
+        if _update_notice:
+            _update_notice = False
+            QTimer.singleShot(600, lambda: inform(self, "Mise à jour", f"IPTV Player est à jour : version <b>{__version__}</b>."))
         src = playlist.source_from_config(self.cfg)
         if src:
             self._load(src, use_cache=True)  # lecture du cache et…
@@ -3518,9 +3595,15 @@ def main() -> int:
         except Exception:
             pass
     app.setApplicationName("IPTV Player")
+    if _already_running(app):
+        return 0
     app.setWindowIcon(QIcon(config.asset_path("icon.ico")))
     ui.apply_theme(app)
     _bridge = _Bridge()
+    front = None
+    if UPDATED:
+        front = _FrontOnShow(app)
+        app.installEventFilter(front)
 
     while vlc is None:
         answer = QMessageBox.question(
@@ -3574,6 +3657,8 @@ def main() -> int:
         config.set_profile(picker.chosen)
     _main_window = MainWindow()
     _main_window.showMaximized()
+    if front is not None:
+        QTimer.singleShot(5000, lambda: app.removeEventFilter(front))
     return app.exec()
 
 

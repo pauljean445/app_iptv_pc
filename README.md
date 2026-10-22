@@ -67,7 +67,7 @@ Certains antivirus signalent à tort les exécutables PyInstaller : c'est un fau
 Cet installeur contient tout : l'application **et VLC** (rien d'autre à installer sur le PC cible). Il crée les raccourcis (menu Démarrer, bureau en option) et une entrée de désinstallation ; par défaut il s'installe pour l'utilisateur courant, sans droits administrateur. Une mise à jour = lancer le nouvel installeur par-dessus ; les réglages (`%APPDATA%`) sont conservés.
 
 ### Mise à jour depuis l'appli
-L'appli installée cherche une nouvelle version 8 s après le démarrage (et via *☰ > Mise à jour*). Si elle en trouve une, elle propose de la télécharger, lance l'installeur en mode silencieux, se ferme, puis l'installeur la relance (réglages, favoris et reprises conservés).
+L'appli installée cherche une nouvelle version 8 s après le démarrage (et via *☰ > Mise à jour*). Si elle en trouve une, elle propose de la télécharger, lance l'installeur en mode silencieux (sa fenêtre de progression prévient que l'appli va revenir), se ferme, puis l'installeur la relance au premier plan avec un message « IPTV Player est à jour » (réglages, favoris et reprises conservés). Une seule appli ouverte à la fois : la relancer alors qu'elle tourne déjà ramène sa fenêtre devant.
 
 Les versions viennent de la page *Releases* du dépôt GitHub `pauljean445/app_iptv_pc` (constante `REPO` dans `iptvplayer/update.py`), qui doit être **public** : un dépôt privé n'est pas accessible sans identifiants. Pour garder le code privé, créer un dépôt public vide servant seulement aux installeurs et y faire pointer `REPO`.
 

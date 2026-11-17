@@ -103,11 +103,20 @@ QPushButton#menuBtn {{ background: transparent; color: {C['text']}; border: none
     padding: 2px 10px; }}
 QPushButton#menuBtn:hover {{ color: {C['accent_hi']}; }}
 QPushButton#menuBtn::menu-indicator {{ image: none; width: 0; }}
-#section {{ background: {C['surface']}; border: 1px solid {C['line']}; border-radius: 14px; }}
+#section {{ background: transparent; border: none; }}
 QPushButton#sectionTitle {{ background: transparent; border: none; color: {C['text']};
-    font-size: 14pt; font-weight: 700; padding: 0; text-align: left; }}
+    font-size: 17pt; font-weight: 700; padding: 0; text-align: left; }}
 QPushButton#sectionTitle:hover {{ color: {C['accent_hi']}; }}
-#sectionSub, #empty {{ color: {C['muted']}; }}
+#sectionSub {{ color: {C['muted']}; font-size: 11.5pt; padding-top: 4px; }}
+#groupTitle {{ color: {C['text']}; font-size: 19pt; font-weight: 700; padding-top: 6px; }}
+QPushButton#subTitle {{ background: transparent; border: none; color: {C['muted']};
+    font-size: 10.5pt; font-weight: 700; letter-spacing: 1.5px; padding: 0; text-align: left; }}
+#groupLine, #groupSep {{ background: {C['line']}; }}
+QPushButton#subTitle:hover {{ color: {C['accent_hi']}; }}
+QPushButton#seeAll {{ background: transparent; border: none; color: {C['accent_hi']}; font-size: 10.5pt;
+    font-weight: 600; padding: 0 4px; }}
+QPushButton#seeAll:hover {{ color: {C['text']}; text-decoration: underline; }}
+#empty {{ color: {C['muted']}; }}
 #empty {{ font-size: 10.5pt; }}
 
 QScrollArea#details {{ background: {C['bg']}; border: none; }}
@@ -786,8 +795,13 @@ class Mosaic(QListView):
     tileClicked = Signal(object)
     tileRemoved = Signal(object)
 
-    def __init__(self, images, poster: bool, remove_label: str = ""):
+    def __init__(self, images, poster: bool, remove_label: str = "", rows: int = 1):
+        """rows = 2 : une seule ligne tant que les vignettes tiennent dans la largeur ; au-delà, deux lignes remplies
+        dans l'ordre (la 1re moitié en haut, la suite en bas) et défilement vers la droite."""
         super().__init__()
+        self.max_rows = rows
+        self._raw: list = []
+        self._shape = None
         self.remove_label = remove_label
         self.removable = bool(remove_label)
         self.hover_pos = QPointF(-1, -1)
@@ -807,10 +821,54 @@ class Mosaic(QListView):
         self.setStyleSheet("QListView { background: transparent; }")
         self.tiles = TileModel()
         self.setModel(self.tiles)
-        delegate = TileDelegate(images, 116 if poster else 132, poster, self)
+        delegate = TileDelegate(images, (136 if rows == 1 else 112) if poster else 164, poster, self)
         self.setItemDelegate(delegate)
-        self.setFixedHeight(delegate.sizeHint(None, None).height() + 8)
+        self.setFixedHeight(delegate.sizeHint(None, None).height() + 2 * self.spacing() + 8)
         self.clicked.connect(self._emit)
+
+    def set_tiles(self, tiles):
+        self._raw = list(tiles)
+        self._shape = None
+        self._layout_rows()
+
+    def _layout_rows(self):
+        """1 ligne si tout tient dans la largeur, sinon 2 lignes remplies dans l'ordre (mosaïques des groupes)."""
+        tiles = self._raw
+        if self.max_rows == 1:
+            if self._shape is None:
+                self.tiles.set_tiles(tiles)
+                self._shape = 1
+            return
+        size = self.itemDelegate().sizeHint(None, None)
+        cell = size.width() + 2 * self.spacing()
+        cols = max(1, self.viewport().width() // cell)
+        rows = 2 if len(tiles) > cols else 1
+        shape = (rows, len(tiles), cols if rows == 2 else 0)
+        if shape == self._shape:
+            return
+        self._shape = shape
+        if rows == 2:
+            # Le flux haut→bas range les vignettes colonne par colonne : ordre réarrangé pour que la ligne du haut
+            # montre la 1re moitié et celle du bas la suite (lecture ligne par ligne)
+            half = (len(tiles) + 1) // 2
+            order = []
+            for j in range(half):
+                order.append(tiles[j])
+                if half + j < len(tiles):
+                    order.append(tiles[half + j])
+            self.setFlow(QListView.TopToBottom)
+            self.setWrapping(True)
+        else:
+            order = tiles
+            self.setFlow(QListView.LeftToRight)
+            self.setWrapping(False)
+        self.setFixedHeight(rows * (size.height() + 2 * self.spacing()) + 8)
+        self.tiles.set_tiles(order)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.max_rows > 1 and event.size().width() != event.oldSize().width():
+            self._layout_rows()
 
     def _emit(self, index):
         if index.isValid():
@@ -945,28 +1003,44 @@ class GridView(QListView):
 
 class HomeSection(QFrame):
     openTab = Signal(str)
+    seeAll = Signal(str)  # « Tout voir » : la liste complète (onglet, catégorie ★ Favoris / ◷ Vu récemment)
     tileClicked = Signal(str, object)
     tileRemoved = Signal(str, object)
 
-    def __init__(self, kind: str, title: str, subtitle: str, images, poster: bool, remove_label: str):
+    def __init__(self, kind: str, title: str, subtitle: str, images, poster: bool, remove_label: str, tab: str = "",
+                 sub_band: bool = False, rows: int = 1, icon_name: str = ""):
+        """kind : identifiant de la bande (signaux tileClicked / tileRemoved) ; tab : onglet ouvert par le titre ;
+        sub_band : sous-bande d'un groupe (« En cours de lecture » > Films) : titre plus petit."""
         super().__init__()
         self.kind = kind
+        self.tab = tab or kind
         self.setObjectName("section")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 10, 8, 6)
-        lay.setSpacing(4)
+        lay.setContentsMargins(4, 4, 4, 2)
+        lay.setSpacing(6)
         head = QHBoxLayout()
-        self.title_btn = QPushButton(f"{title}  ›")
-        self.title_btn.setObjectName("sectionTitle")
+        head.setSpacing(12)
+        self.title_btn = QPushButton(title.upper() if sub_band else title)
+        self.title_btn.setObjectName("subTitle" if sub_band else "sectionTitle")
+        if icon_name:  # icône de l'onglet : violette sur les grands titres, grise sur les sous-bandes
+            self.title_btn.setIcon(icon(icon_name, C["muted"] if sub_band else C["accent_hi"]))
+            self.title_btn.setIconSize(QSize(18, 18) if sub_band else QSize(26, 26))
         self.title_btn.setCursor(Qt.PointingHandCursor)
         self.title_btn.setToolTip(f"Ouvrir l'onglet {title}")
-        self.title_btn.clicked.connect(lambda: self.openTab.emit(self.kind))
+        self.title_btn.clicked.connect(lambda: self.openTab.emit(self.tab))
         self.sub = QLabel(subtitle)
         self.sub.setObjectName("sectionSub")
-        head.addWidget(self.title_btn)
-        head.addWidget(self.sub)
+        head.addWidget(self.title_btn, 0, Qt.AlignBottom)
+        head.addWidget(self.sub, 0, Qt.AlignBottom)
+        self.see_all = QPushButton("Tout voir  ›")
+        self.see_all.setObjectName("seeAll")
+        self.see_all.setCursor(Qt.PointingHandCursor)
+        self.see_all.setFocusPolicy(Qt.NoFocus)
+        self.see_all.clicked.connect(lambda: self.seeAll.emit(self.kind))
+        self.see_all.hide()
+        head.addWidget(self.see_all, 0, Qt.AlignBottom)
         head.addStretch(1)
-        self.mosaic = Mosaic(images, poster, remove_label)
+        self.mosaic = Mosaic(images, poster, remove_label, rows=rows)
         self.mosaic.tileClicked.connect(lambda item: self.tileClicked.emit(self.kind, item))
         self.mosaic.tileRemoved.connect(lambda item: self.tileRemoved.emit(self.kind, item))
         # Flèches de défilement de la bande (affichées seulement si elle dépasse la largeur)
@@ -978,6 +1052,9 @@ class HomeSection(QFrame):
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
             b.clicked.connect(lambda _=False, d=direction: self.mosaic.scroll_page(d))
+            policy = b.sizePolicy()
+            policy.setRetainSizeWhenHidden(True)  # place gardée : titres alignés entre deux bandes côte à côte
+            b.setSizePolicy(policy)
             head.addWidget(b)
             self.arrows.append(b)
         self.mosaic.horizontalScrollBar().rangeChanged.connect(self._update_arrows)
@@ -1000,12 +1077,18 @@ class HomeSection(QFrame):
         self.arrows[0].setEnabled(bar.value() > bar.minimum())
         self.arrows[1].setEnabled(bar.value() < bar.maximum())
 
-    def set_tiles(self, tiles: list[Tile], empty_text: str):
-        self.mosaic.tiles.set_tiles(tiles)
+    def set_tiles(self, tiles: list[Tile], empty_text: str, total: int | None = None, see_all: bool = False):
+        """total : nombre réel (l'accueil n'en montre qu'une partie) ; see_all : lien « Tout voir » affiché."""
+        self.mosaic.set_tiles(tiles)
+        self.see_all.setVisible(see_all and bool(tiles))
         self.empty.setText(empty_text)
         self.mosaic.setVisible(bool(tiles))
         self.empty.setVisible(not tiles)
-        self.sub.setText(f"{self.base_subtitle} · {len(tiles)}" if tiles else self.base_subtitle)
+        n = len(tiles) if total is None else total
+        if self.base_subtitle:
+            self.sub.setText(f"{self.base_subtitle} · {n}" if tiles else self.base_subtitle)
+        else:
+            self.sub.setText(str(n) if tiles else "")
         self._update_arrows()
 
     def showEvent(self, event):
@@ -1066,14 +1149,21 @@ class HomePage(QScrollArea):
     """Accueil : une bande horizontale par onglet, empilées ; la page défile si l'écran est trop petit."""
 
     openTab = Signal(str)
+    seeAll = Signal(str)
     tileClicked = Signal(str, object)
     tileRemoved = Signal(str, object)
 
+    # (bande, onglet, titre, sous-titre, affiches, libellé « retirer », sous-bande, icône) ;
+    # ("@", titre, icône, (sous-bandes…)) = groupe : Films et Séries côte à côte
     SECTIONS = (
-        ("live", "Direct", "Chaînes favorites", False, "Retirer des favoris"),
-        ("movie", "Films", "En cours de lecture", True, "Retirer des lectures en cours"),
-        ("series", "Séries", "En cours de lecture", True, "Retirer des lectures en cours"),
-        ("replay", "Replays", "Chaînes favorites", False, "Retirer des favoris"),
+        ("live", "live", "Direct", "Chaînes favorites", False, "Retirer des favoris", False, "live"),
+        ("@", "En cours de lecture", "play", (
+            ("movie", "movie", "Films", "", True, "Retirer des lectures en cours", True, "film"),
+            ("series", "series", "Séries", "", True, "Retirer des lectures en cours", True, "series"))),
+        ("@", "Favoris", "star", (
+            ("movie_fav", "movie", "Films", "", True, "Retirer des favoris", True, "film"),
+            ("series_fav", "series", "Séries", "", True, "Retirer des favoris", True, "series"))),
+        ("replay", "replay", "Replays", "Chaînes favorites", False, "Retirer des favoris", False, "replay"),
     )
 
     def __init__(self, images):
@@ -1088,16 +1178,47 @@ class HomePage(QScrollArea):
         content.setAttribute(Qt.WA_StyledBackground, True)
         self.setWidget(content)
         col = QVBoxLayout(content)
-        col.setContentsMargins(16, 12, 16, 16)
-        col.setSpacing(12)
+        col.setContentsMargins(28, 16, 20, 20)
+        col.setSpacing(22)
         self.sections: dict[str, HomeSection] = {}
-        for kind, title, sub, poster, remove_label in self.SECTIONS:
-            sec = HomeSection(kind, title, sub, images, poster, remove_label)
+        def add(entry, rows=1):
+            kind, tab, title, sub, poster, remove_label, sub_band, icon_name = entry
+            sec = HomeSection(kind, title, sub, images, poster, remove_label, tab=tab, sub_band=sub_band, rows=rows,
+                              icon_name=icon_name)
             sec.openTab.connect(self.openTab)
+            sec.seeAll.connect(self.seeAll)
             sec.tileClicked.connect(self.tileClicked)
             sec.tileRemoved.connect(self.tileRemoved)
             self.sections[kind] = sec
-            col.addWidget(sec)
+            return sec
+
+        for entry in self.SECTIONS:
+            if entry[0] == "@":  # groupe : icône + titre + trait, puis Films | Séries (mosaïques de 2 lignes)
+                hrow = QHBoxLayout()
+                hrow.setSpacing(4)
+                ic = QLabel()
+                ic.setPixmap(icon(entry[2], C["accent_hi"]).pixmap(QSize(28, 28)))
+                head = QLabel(entry[1])
+                head.setObjectName("groupTitle")
+                line = QFrame()
+                line.setObjectName("groupLine")
+                line.setFixedHeight(1)
+                hrow.addWidget(ic)
+                hrow.addWidget(head)
+                hrow.addWidget(line, 1, Qt.AlignVCenter)
+                col.addLayout(hrow)
+                row = QHBoxLayout()
+                row.setSpacing(24)
+                for i, sub in enumerate(entry[3]):
+                    if i:
+                        sep = QFrame()
+                        sep.setObjectName("groupSep")
+                        sep.setFixedWidth(1)
+                        row.addWidget(sep)
+                    row.addWidget(add(sub, rows=2), 1, Qt.AlignTop)  # Films et Séries alignés en haut
+                col.addLayout(row)
+                continue
+            col.addWidget(add(entry))
         col.addStretch(1)
 
     def refresh_images(self):

@@ -96,7 +96,8 @@ MAX_RETRIES = 5
 SYNC_MS = 30_000        # synchro avec le compte du foyer : toutes les 30 s…
 SYNC_ROOT_EVERY = 4     # … et la liste des profils un passage sur 4 (2 min)
 TABS = [("live", "Direct"), ("movie", "Films"), ("series", "Séries"), ("replay", "Replays")]
-GRID_TABS = ("live", "movie", "series", "replay")  # onglets ouverts en mosaïque (un clic : liste + fiche / lecture)
+GRID_TABS = ("live", "movie", "series", "replay")
+HOME_MAX = 12  # vignettes au plus par bande « En cours » / « Favoris » de l'accueil (« Tout voir » pour le reste)  # onglets ouverts en mosaïque (un clic : liste + fiche / lecture)
 TAB_ICONS = {"live": "live", "movie": "film", "series": "series", "replay": "replay"}
 TAB_COUNT = {"live": "chaînes", "movie": "films", "series": "séries", "replay": "chaînes en replay"}
 SEARCH_TAB = len(TABS) + 1  # onglet « Recherche » (page à part), après Accueil et les onglets de contenu
@@ -878,6 +879,7 @@ class MainWindow(QMainWindow):
         # Page d'accueil (mosaïques) et pages de navigation, sous un bandeau commun
         self.home = ui.HomePage(self.images)
         self.home.openTab.connect(self.show_browse)
+        self.home.seeAll.connect(self._home_see_all)
         self.search_page = ui.SearchPage(self.images)
         self.search_page.tileClicked.connect(self._open_from_search)
         self.search_page.openTab.connect(self.show_browse)
@@ -907,6 +909,8 @@ class MainWindow(QMainWindow):
         self.grid = ui.GridView(self.images, self._grid_tile)
         self.grid.setModel(self.model)
         self.grid.clicked.connect(self._on_grid_clicked)
+        self.grid.setContextMenuPolicy(Qt.CustomContextMenu)  # clic droit : favoris, lire, télécharger…
+        self.grid.customContextMenuRequested.connect(lambda pos: self._context_menu(pos, self.grid))
         gv.addWidget(self.grid, 1)
         self.grid_count = QLabel()
         self.grid_count.setObjectName("countLabel")
@@ -1297,6 +1301,8 @@ class MainWindow(QMainWindow):
             if it is None:
                 continue
             entry = lib.recent[k]
+            if self._series_done(it, entry):
+                continue  # dernier épisode disponible vu : plus « en cours » (toujours dans ◷ Vu récemment)
             prog = lib.progress.get(entry.get("last_ep", ""), {})
             pos, length = prog.get("pos", 0), prog.get("len", 0)
             label = entry.get("last_label", "")
@@ -1305,18 +1311,62 @@ class MainWindow(QMainWindow):
                    if label else "En cours")
             series.append(ui.Tile(it, it.name, sub, pos / length if length else -1))
 
+        def favorites(tab):
+            """Favoris films / séries : même texte que les mosaïques (film : année · ★ note · durée ; série : ★ note),
+            les derniers ajoutés d'abord."""
+            out = []
+            keys = sorted(lib.favorite_keys(tab), key=lambda k: lib.fav.get(f"{tab}|{k}", {}).get("t", 0), reverse=True)
+            for k in keys:
+                it = by_key.get(k)
+                if it is None:
+                    continue
+                bits = (_year_of(it), _short_rating(it), _runtime_text(it)) if tab == "movie" else (_short_rating(it),)
+                out.append(ui.Tile(it, it.name, " · ".join(b for b in bits if b)))
+            return out
+
         wait = "Chargement du catalogue…"
         secs["live"].set_tiles(channels("live"), wait if loading else
                                "Aucune chaîne favorite.\nDans l'onglet Direct, ajoute-en avec ★ (Ctrl+D).")
         secs["replay"].set_tiles(channels("replay"), wait if loading else
                                  "Aucune chaîne favorite.\nDans l'onglet Replays, ajoute-en avec ★ (Ctrl+D).")
-        secs["movie"].set_tiles(movies, wait if loading else
-                                "Aucun film en cours.\nLes films commencés apparaîtront ici.")
-        secs["series"].set_tiles(series, wait if loading else
-                                 "Aucune série en cours.\nLes séries commencées apparaîtront ici.")
+        # Accueil = aperçu : 12 au plus par bande (les plus récents), « Tout voir » pour la liste complète
+        for key, tiles, empty in (
+                ("movie", movies, "Aucun film en cours.\nLes films commencés apparaîtront ici."),
+                ("series", series, "Aucune série en cours.\nLes séries commencées apparaîtront ici."),
+                ("movie_fav", favorites("movie"), "Aucun film favori.\nSur la fiche d'un film : bouton ☆ Favori (ou Ctrl+D)."),
+                ("series_fav", favorites("series"),
+                 "Aucune série favorite.\nSur la fiche d'une série : bouton ☆ Favori (ou Ctrl+D).")):
+            secs[key].set_tiles(tiles[:HOME_MAX], wait if loading else empty, total=len(tiles), see_all=True)
+
+    def _series_done(self, show, entry: dict) -> bool:
+        """Série « finie pour l'instant » : son dernier épisode disponible est vu (épisodes connus), ou tous ses
+        épisodes connus sont vus. De nouveaux épisodes la refont apparaître dans « En cours »."""
+        last = entry.get("last_ep", "")
+        if not last or last not in self.library.watched:
+            return False
+        eps = show.episodes
+        if eps:
+            return eps[-1].key in self.library.watched
+        total = entry.get("total") or 0
+        return total > 0 and len(self.library.watched_keys(show.key)) >= total
+
+    def _home_see_all(self, kind: str):
+        """« Tout voir » d'une bande de l'accueil : l'onglet en mosaïque, sur ★ Favoris ou ◷ Vu récemment."""
+        tab = kind.split("_")[0]
+        self.tab_group[tab] = FAV if kind.endswith("_fav") else RECENT
+        if self.search.text():
+            self.search.blockSignals(True)
+            self.search.clear()
+            self.search.blockSignals(False)
+        self.show_browse(tab, grid=True)
 
     def _on_tile(self, kind: str, it):
-        """Clic sur une vignette de l'accueil : on lance directement."""
+        """Clic sur une vignette de l'accueil : en cours / chaînes -> lecture directe ; favoris -> la fiche."""
+        if kind.endswith("_fav"):
+            tab = kind.split("_")[0]
+            self.show_browse(tab, grid=False)
+            self._select_key(it.key, center=True)
+            return
         self.show_browse(kind, grid=False)
         self._select_key(it.key, center=True)
         if kind == "live":
@@ -1331,9 +1381,10 @@ class MainWindow(QMainWindow):
     def _on_tile_removed(self, kind: str, it):
         """Croix d'une vignette de l'accueil : la chaîne quitte les favoris, le film / la série les lectures
         en cours (position de reprise comprise, comme « Retirer de « Vu récemment » »)."""
-        if kind in ("live", "replay"):
-            if self.library.is_favorite(kind, it.key):
-                self.library.toggle_favorite(kind, it.key)
+        if kind in ("live", "replay", "movie_fav", "series_fav"):
+            tab = kind.split("_")[0]
+            if self.library.is_favorite(tab, it.key):
+                self.library.toggle_favorite(tab, it.key)
             msg = f"{it.name} : retiré des favoris"
         else:
             self.library.remove_recent(it.key, [e.key for e in (it.episodes or [])])
@@ -2942,22 +2993,36 @@ class MainWindow(QMainWindow):
         if idx.isValid():
             self._toggle_favorite(self.model.item(idx.row()))
 
-    def _context_menu(self, pos):
-        idx = self.list.indexAt(pos)
+    def _context_menu(self, pos, view=None):
+        """Clic droit sur une ligne de la liste ou une tuile de la mosaïque (même modèle, même menu)."""
+        view = view if view is not None else self.list  # (un widget Qt peut valoir « faux » : pas de « or »)
+        idx = view.indexAt(pos)
         if not idx.isValid():
             return
         it = self.model.item(idx.row())
         menu = QMenu(self)
         lib = self.library
+
+        def here(action):
+            """Action qui ouvre quelque chose : depuis la mosaïque, d'abord l'affichage liste + lecteur / fiche
+            (sinon la lecture partait derrière la mosaïque, invisible)."""
+            def run():
+                if view is self.grid:
+                    self.grid_wanted = False
+                    self._sync_grid()
+                    self._select_key(it.key, center=True)
+                action()
+            return run
+
         if self.tab == "replay" and it.kind == "live":
-            menu.addAction("Voir les replays", lambda: self.open_programs(it))
-            menu.addAction("Regarder en direct", lambda: self.play_item(it))
+            menu.addAction("Voir les replays", here(lambda: self.open_programs(it)))
+            menu.addAction("Regarder en direct", here(lambda: self.play_item(it)))
         elif it.kind == "series":
-            menu.addAction("Lire", lambda: self.open_series(it, play_resume=True))
+            menu.addAction("Lire", here(lambda: self.open_series(it, play_resume=True)))
         else:
-            menu.addAction("Lire", lambda: self.play_item(it))
+            menu.addAction("Lire", here(lambda: self.play_item(it)))
             if it.kind in RESUMABLE and lib.resume_position(it.key):
-                menu.addAction("Lire depuis le début", lambda: self.play_item(it, resume=False))
+                menu.addAction("Lire depuis le début", here(lambda: self.play_item(it, resume=False)))
         tab, target = self._fav_tab(it)
         if target is not None:
             fav = lib.is_favorite(tab, target.key)
@@ -2974,7 +3039,7 @@ class MainWindow(QMainWindow):
         recent_key = it.parent.key if it.kind == "episode" else it.key
         if recent_key in lib.recent:
             menu.addAction("Retirer de « Vu récemment »", lambda: self._remove_recent(recent_key))
-        if self.model.reorderable:
+        if self.model.reorderable and view is self.list:  # ordre des favoris : depuis la liste seulement
             row, last = idx.row(), len(self.model.items) - 1
             menu.addSeparator()
             if row > 0:
@@ -2983,7 +3048,7 @@ class MainWindow(QMainWindow):
             if row < last:
                 menu.addAction("Descendre\tCtrl+↓", lambda: self.move_favorite_selected(+1))
                 menu.addAction("Mettre en dernier", lambda: self._move_favorite(row, last + 1))
-        menu.exec(self.list.viewport().mapToGlobal(pos))
+        menu.exec(view.viewport().mapToGlobal(pos))
 
     def _set_watched(self, ep: playlist.Item, watched: bool):
         lib = self.library

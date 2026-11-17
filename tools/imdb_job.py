@@ -311,10 +311,20 @@ def main() -> int:
     tmdb_token = os.environ.get("TMDB_TOKEN", "").strip()
     day = today.strftime("%Y%m%d")
     if tmdb_token:
+        def since(datestr: str) -> int:
+            try:
+                return (today - datetime.strptime(datestr[:8], "%Y%m%d").replace(tzinfo=timezone.utc)).days
+            except ValueError:
+                return 10 ** 6
+
         def needs_tmdb(k: str) -> bool:
             v = changes.get(k, base.get(k, ""))
-            if not v or v.startswith("?"):
-                return due(k)
+            if not v:
+                return True
+            if v.startswith("?"):
+                # « ?AAAAMMJJT » : TMDB n'a pas trouvé -> nouvel essai au bout d'un mois ;
+                # « ?AAAAMMJJ » : seul Wikidata a échoué -> TMDB tout de suite
+                return since(v[1:9]) >= TMDB_RETRY_DAYS if v.endswith("T") else True
             tt, r, d, y = decode(v)
             if tt and d and y:
                 return False  # complet
@@ -348,6 +358,8 @@ def main() -> int:
                     tt, d, y = res[0] or ot, res[1] or od, res[2] or oy
                 if tt:
                     changes[k] = encode(tt, orr, d, y, day)
+                elif not old.startswith("tt"):
+                    changes[k] = "?" + day + "T"  # TMDB ne relie pas ce titre à IMDb (réessai dans un mois)
                 done_n += 1
                 if done_n % 1000 == 0:
                     flush(changes)
@@ -375,7 +387,10 @@ def main() -> int:
                 break
             for k in batch:
                 hit = found.get(k[1:])
-                changes[k] = encode(hit[0], -1, hit[1], hit[2]) if hit else stamp
+                if hit:
+                    changes[k] = encode(hit[0], -1, hit[1], hit[2])
+                elif not changes.get(k, "").startswith("?"):
+                    changes[k] = stamp  # (marqueur TMDB du même passage gardé)
             lots += 1
             if lots % SAVE_EVERY == 0:
                 flush(changes)

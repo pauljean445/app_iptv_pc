@@ -2137,8 +2137,8 @@ class MainWindow(QMainWindow):
             found = [i for i in self.by_tab.get(kind, []) if text in self._norm_name(i)]
             out = []
             for it in found[:SEARCH_MAX]:
-                sub = " · ".join(x for x in (_year_of(it), _short_rating(it), _runtime_text(it) if it.kind == "movie" else "")
-                                 if x)
+                sub = " · ".join(x for x in ((_year_of(it), _short_rating(it), _runtime_text(it)) if it.kind == "movie"
+                                             else (_short_rating(it),)) if x)
                 pos, length = lib.resume_position(it.key), lib.progress.get(it.key, {}).get("len", 0)
                 out.append(ui.Tile(it, it.name, sub, pos / length if pos and length else -1))
             return out, len(found)
@@ -2355,7 +2355,8 @@ class MainWindow(QMainWindow):
                 sub += f" · replay {it.archive_days} j"
         else:  # film, série
             # Liste et mosaïque : année · ★ note IMDb · durée, rien d'autre (le reste est sur la fiche)
-            bits = [_year_of(it), _short_rating(it), _runtime_text(it) if it.kind == "movie" else ""]
+            # séries : la note seulement (année et durée peu parlantes pour une série)
+            bits = [_year_of(it), _short_rating(it), _runtime_text(it)] if it.kind == "movie" else [_short_rating(it)]
             sub = " · ".join(b for b in bits if b)
             entry = lib.recent.get(it.key) if it.kind == "series" else None
             if entry:

@@ -77,13 +77,16 @@ class Base:
         by_shard: dict[str, dict] = {}
         for k in missing:
             by_shard.setdefault(shard(k), {})[k] = ""
-        for name, fields in by_shard.items():
-            items = list(fields.items())
-            for i in range(0, len(items), 1000):
-                chunk = dict(items[i:i + 1000])
-                session.commit([(f"imdb_req/{name}", chunk, [])], timeout=30)
-                with self.lock:
-                    self.requested.update(chunk)
+        try:
+            for name, fields in by_shard.items():
+                items = list(fields.items())
+                for i in range(0, len(items), 1000):
+                    chunk = dict(items[i:i + 1000])
+                    session.commit([(f"imdb_req/{name}", chunk, [])], timeout=30)
+                    with self.lock:
+                        self.requested.update(chunk)
+        except Exception:
+            self.pulled = 0  # coupure : la suite au prochain passage
         self.save()
         return changed
 

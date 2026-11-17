@@ -29,10 +29,16 @@ DOC_NAME = f"projects/{PROJECT_ID}/databases/(default)/documents"
 DB_URL = f"https://firestore.googleapis.com/v1/{DOC_NAME}"
 AUTH_URL = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
 RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
-UA = {"User-Agent": "IPTVPlayer-imdb-job (tâche planifiée, usage personnel)"}
+# Wikimedia demande aux programmes de s'identifier (nom + adresse de contact) : sinon, depuis les machines partagées
+# de GitHub, les appels sont vite refusés (« 429 Too Many Requests »)
+UA = {"User-Agent": "IPTVPlayerImdbJob/1.1 (https://github.com/pauljean445/app_iptv_pc; tache planifiee, usage "
+                    "personnel) python-urllib"}
 SHARDS = 16
 BATCH = 50
 MISS_RETRY_DAYS = 7
+PAUSE = 2.0               # secondes entre deux lots (deux appels Wikidata chacun)
+SAVE_EVERY = 20           # lots : écriture intermédiaire dans la base (rien de perdu si la tâche s'arrête)
+WIKIDATA_BUDGET = 45 * 60 # au-delà, la suite est reprise la nuit suivante (la tâche est limitée à 60 min)
 TMDB_PROP = {"m": "P4947", "s": "P4983"}
 UNITS = {"Q7727": 1, "Q25235": 60, "Q11574": 1 / 60}  # minute, heure, seconde
 
@@ -79,9 +85,25 @@ def write_fields(path: str, fields: dict, token: str) -> None:
 
 # ---- Wikidata --------------------------------------------------------------------------- #
 def wikidata(**params) -> dict:
-    url = "https://www.wikidata.org/w/api.php?" + urlencode({**params, "format": "json"})
-    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
-        return json.loads(r.read())
+    """Appel à l'API Wikidata ; trop d'appels (429 / 503 / « maxlag ») : attente demandée par le serveur, puis nouvel
+    essai (6 au plus)."""
+    url = "https://www.wikidata.org/w/api.php?" + urlencode({**params, "format": "json", "maxlag": 5})
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
+                data = json.loads(r.read())
+                wait = r.headers.get("Retry-After")
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 503):
+                raise
+            wait = e.headers.get("Retry-After")
+            data = None
+        if data is not None and data.get("error", {}).get("code") != "maxlag":
+            return data
+        delay = int(wait) if str(wait or "").isdigit() else 30 * (attempt + 1)
+        log(f"  Wikidata demande d'attendre {delay} s")
+        time.sleep(min(delay, 300))
+    raise RuntimeError("Wikidata refuse les appels (trop de demandes)")
 
 
 def _minutes(claims: list) -> int:
@@ -190,27 +212,47 @@ def main() -> int:
         return False
 
     changes: dict[str, str] = {}
+    written: dict[str, str] = {}
+
+    def flush(values: dict) -> None:
+        """Écrit dans la base ce qui a changé depuis le dernier envoi."""
+        todo_w = {k: v for k, v in values.items() if base.get(k) != v and written.get(k) != v}
+        by = {}
+        for k, v in todo_w.items():
+            by.setdefault(f"imdb/s{int(k[1:]) % SHARDS:02d}", {})[k] = v
+        for path, fields in sorted(by.items()):
+            write_fields(path, fields, token)
+        written.update(todo_w)
+
     todo = sorted(k for k in requested if due(k))
     log(f"à relier par Wikidata : {len(todo)}")
+    lots = 0
+    stopped = False
     for kind in ("m", "s"):
         keys = [k for k in todo if k[0] == kind]
         for i in range(0, len(keys), BATCH):
+            if time.time() - started > WIKIDATA_BUDGET:
+                stopped = True
+                break
             batch = keys[i:i + BATCH]
-            for attempt in range(3):
-                try:
-                    found = lookup_batch(kind, [k[1:] for k in batch])
-                    break
-                except Exception as e:  # Wikidata refuse des appels trop rapprochés : on patiente
-                    log("  Wikidata :", e)
-                    time.sleep(20 * (attempt + 1))
-            else:
-                continue
+            try:
+                found = lookup_batch(kind, [k[1:] for k in batch])
+            except Exception as e:
+                log("  Wikidata :", e, "- arrêt pour cette nuit, reprise la nuit suivante")
+                stopped = True
+                break
             for k in batch:
                 hit = found.get(k[1:])
                 changes[k] = encode(hit[0], -1, hit[1], hit[2]) if hit else stamp
-            if (i // BATCH) % 20 == 0:
-                log(f"  {kind} : {min(i + BATCH, len(keys))} / {len(keys)}")
-            time.sleep(1)
+            lots += 1
+            if lots % SAVE_EVERY == 0:
+                flush(changes)
+                log(f"  {kind} : {min(i + BATCH, len(keys))} / {len(keys)} (enregistré)")
+            time.sleep(PAUSE)
+        if stopped:
+            break
+    if stopped:
+        log(f"  {len(changes)} titres traités cette nuit sur {len(todo)}")
 
     ratings = load_ratings()
     log(f"notes IMDb : {len(ratings)} titres")
@@ -225,13 +267,9 @@ def main() -> int:
         elif k in changes and changes[k] != new:
             changes[k] = new
 
+    flush(changes)
     real = {k: v for k, v in changes.items() if base.get(k) != v}
-    by_shard: dict[str, dict] = {}
-    for k, v in real.items():
-        by_shard.setdefault(f"imdb/s{int(k[1:]) % SHARDS:02d}", {})[k] = v
-    for path, fields in sorted(by_shard.items()):
-        write_fields(path, fields, token)
-    known = sum(1 for v in merged.values() if v and not v.startswith("?"))
+    known = sum(1 for v in {**merged, **changes}.values() if v and not v.startswith("?"))
     log(f"écrit : {len(real)} titres modifiés ; base : {known} titres reliés à IMDb ; {time.time() - started:.0f} s")
     return 0
 

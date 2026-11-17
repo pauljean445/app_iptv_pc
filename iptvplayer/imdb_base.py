@@ -61,16 +61,18 @@ class Base:
         """Lit la base commune, puis inscrit pour la tâche de la nuit les titres du catalogue qui n'y sont pas.
         Retourne True si des notes ont changé ici."""
         changed = False
+        fresh, complete = {}, True  # copie locale = miroir exact de la base commune
         for i in range(SHARDS):
             try:
                 doc = session.get_root_doc(f"imdb/s{i:02d}") or {}
             except Exception:
+                complete = False
                 break  # base commune pas encore lisible (règle) ou hors ligne : on inscrit quand même les titres
-            with self.lock:
-                for k, v in doc.items():
-                    if isinstance(v, str) and self.values.get(k) != v:
-                        self.values[k] = v
-                        changed = True
+            fresh.update({k: v for k, v in doc.items() if isinstance(v, str)})
+        with self.lock:
+            if complete and fresh != self.values:
+                self.values = fresh
+                changed = True
         self.pulled = time.time()
         with self.lock:
             missing = [k for k in dict.fromkeys(keys) if k and k not in self.values and k not in self.requested]

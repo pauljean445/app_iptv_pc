@@ -5,15 +5,23 @@
    les applis PC / TV / téléphone quand un titre de leur catalogue n'est pas dans la base).
 3. Relie les nouveaux titres (numéro TMDB du fournisseur) à IMDb par Wikidata, 50 par appel : identifiant IMDb,
    durée (P2047), année (P577 / P580). Titres inconnus : marqués « ?AAAAMMJJ », réessayés au bout d'une semaine.
-4. Met à jour toutes les notes avec le fichier officiel d'IMDb (datasets.imdbws.com/title.ratings.tsv.gz, gratuit
-   pour un usage personnel non commercial, publié chaque jour).
+4. Prend chez IMDb, pour tous les titres reliés, la note (datasets.imdbws.com/title.ratings.tsv.gz) ET l'année et
+   la durée (title.basics.tsv.gz, 230 Mo lus au fil du téléchargement, ~15 s) : fichiers officiels, gratuits pour un
+   usage personnel non commercial, publiés chaque jour. TMDB / Wikidata ne servent qu'à relier le numéro TMDB du
+   fournisseur à l'identifiant IMDb (IMDb ne fournit pas ce lien), et en secours si IMDb n'a pas l'info.
 5. Écrit la base commune imdb/sNN : "m<tmdb>" (film) / "s<tmdb>" (série) = "tt…|note×10|durée min|année".
 
-Variables d'environnement (secrets GitHub) : ROBOT_EMAIL, ROBOT_PASSWORD, HOUSEHOLDS (UID séparés par des virgules).
+3 bis. Si TMDB_TOKEN est fourni (clé gratuite de l'API TMDB, la base d'où viennent les numéros du fournisseur) :
+   identifiant IMDb, durée et année d'abord par TMDB (complet, même pour les films récents), pour les nouveaux titres
+   et ceux à qui il manque une info ; Wikidata seulement pour ce que TMDB ne relie pas.
+
+Variables d'environnement (secrets GitHub) : ROBOT_EMAIL, ROBOT_PASSWORD, HOUSEHOLDS (UID séparés par des virgules),
+TMDB_TOKEN (facultatif : « jeton d'accès en lecture » v4 ou clé v3).
 Aucun identifiant IPTV n'est utilisé ici. Bibliothèque standard Python seulement.
 """
 import gzip
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import sys
@@ -29,6 +37,7 @@ DOC_NAME = f"projects/{PROJECT_ID}/databases/(default)/documents"
 DB_URL = f"https://firestore.googleapis.com/v1/{DOC_NAME}"
 AUTH_URL = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
 RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
+BASICS_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
 # Wikimedia demande aux programmes de s'identifier (nom + adresse de contact) : sinon, depuis les machines partagées
 # de GitHub, les appels sont vite refusés (« 429 Too Many Requests »)
 UA = {"User-Agent": "IPTVPlayerImdbJob/1.1 (https://github.com/pauljean445/app_iptv_pc; tache planifiee, usage "
@@ -40,6 +49,9 @@ PAUSE = 2.0               # secondes entre deux lots (deux appels Wikidata chacu
 SAVE_EVERY = 20           # lots : écriture intermédiaire dans la base (rien de perdu si la tâche s'arrête)
 WIKIDATA_BUDGET = 45 * 60 # au-delà, la suite est reprise la nuit suivante (la tâche est limitée à 60 min)
 TMDB_PROP = {"m": "P4947", "s": "P4983"}
+TMDB_URL = "https://api.themoviedb.org/3"
+TMDB_RETRY_DAYS = 30      # titre vérifié sur TMDB mais encore incomplet : nouvel essai au bout d'un mois
+TMDB_WORKERS = 8
 UNITS = {"Q7727": 1, "Q25235": 60, "Q11574": 1 / 60}  # minute, heure, seconde
 
 
@@ -85,10 +97,11 @@ def write_fields(path: str, fields: dict, token: str) -> None:
 
 # ---- Wikidata --------------------------------------------------------------------------- #
 def wikidata(**params) -> dict:
-    """Appel à l'API Wikidata ; trop d'appels (429 / 503 / « maxlag ») : attente demandée par le serveur, puis nouvel
-    essai (6 au plus)."""
-    url = "https://www.wikidata.org/w/api.php?" + urlencode({**params, "format": "json", "maxlag": 5})
-    for attempt in range(6):
+    """Appel à l'API Wikidata (lecture seule : pas de « maxlag », réservé aux programmes qui modifient Wikidata et qui
+    faisait refuser nos lectures dès que ses serveurs avaient quelques secondes de retard). Trop d'appels (429 / 503) :
+    attente (celle demandée par le serveur, au moins 15 s puis de plus en plus), 8 essais au plus."""
+    url = "https://www.wikidata.org/w/api.php?" + urlencode({**params, "format": "json"})
+    for attempt in range(8):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
                 data = json.loads(r.read())
@@ -100,7 +113,7 @@ def wikidata(**params) -> dict:
             data = None
         if data is not None and data.get("error", {}).get("code") != "maxlag":
             return data
-        delay = int(wait) if str(wait or "").isdigit() else 30 * (attempt + 1)
+        delay = max(int(wait) if str(wait or "").isdigit() else 0, 15 * (attempt + 1))
         log(f"  Wikidata demande d'attendre {delay} s")
         time.sleep(min(delay, 300))
     raise RuntimeError("Wikidata refuse les appels (trop de demandes)")
@@ -167,8 +180,79 @@ def load_ratings() -> dict:
     return out
 
 
-def encode(tt: str, r: int, d: int, y: int) -> str:
-    return f"{tt}|{r if r >= 0 else ''}|{d or ''}|{y or ''}"
+def load_basics(wanted: set) -> dict:
+    """{identifiant IMDb : (durée en minutes, année)} pour les titres voulus, lus au fil du téléchargement."""
+    out = {}
+    req = urllib.request.Request(BASICS_URL, headers=UA)
+    with urllib.request.urlopen(req, timeout=300) as r, gzip.GzipFile(fileobj=r) as g:
+        g.readline()  # en-tête : tconst, titleType, primaryTitle, originalTitle, isAdult, startYear, endYear, runtime…
+        for raw in g:
+            tab = raw.find(b"\t")
+            tc = raw[:tab].decode("ascii", "replace")
+            if tc not in wanted:
+                continue
+            p = raw.decode("utf-8", "replace").rstrip("\n").split("\t")
+            year = int(p[5]) if p[5].isdigit() else 0
+            minutes = int(p[7]) if p[7].isdigit() else 0
+            out[tc] = (minutes, year)
+    return out
+
+
+def encode(tt: str, r: int, d: int, y: int, checked: str = "") -> str:
+    """5e champ facultatif : date de la dernière vérification sur TMDB (les applis ne lisent que les 4 premiers)."""
+    base = f"{tt}|{r if r >= 0 else ''}|{d or ''}|{y or ''}"
+    return f"{base}|{checked}" if checked else base
+
+
+def checked_of(text: str) -> str:
+    p = str(text).split("|")
+    return p[4] if len(p) > 4 else ""
+
+
+# ---- TMDB (facultatif) -------------------------------------------------------------------------- #
+def tmdb_get(path: str, token: str):
+    """GET sur l'API TMDB ; None si le titre n'existe pas ; attend si TMDB demande de ralentir."""
+    bearer = len(token) > 40  # jeton v4 (long) ou clé v3 (32 caractères)
+    url = f"{TMDB_URL}/{path}" + ("" if bearer else ("&" if "?" in path else "?") + f"api_key={token}")
+    headers = {**UA, "Accept": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {token}"
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            if e.code == 401:
+                raise RuntimeError("TMDB refuse la clé (401) : vérifier le secret TMDB_TOKEN") from None
+            if e.code != 429 and e.code < 500:
+                raise
+            wait = e.headers.get("Retry-After")
+            time.sleep(max(int(wait) if str(wait or "").isdigit() else 0, 2 * (attempt + 1)))
+    raise RuntimeError("TMDB ne répond pas")
+
+
+def tmdb_lookup(key: str, token: str):
+    """(identifiant IMDb ou "", durée en minutes, année) d'un titre TMDB ; None s'il n'existe pas sur TMDB."""
+    tid = key[1:]
+    if key[0] == "m":
+        d = tmdb_get(f"movie/{tid}?append_to_response=external_ids", token)
+        if d is None:
+            return None
+        tt = d.get("imdb_id") or (d.get("external_ids") or {}).get("imdb_id") or ""
+        minutes = int(d.get("runtime") or 0)
+        date = str(d.get("release_date") or "")
+    else:
+        d = tmdb_get(f"tv/{tid}?append_to_response=external_ids", token)
+        if d is None:
+            return None
+        tt = (d.get("external_ids") or {}).get("imdb_id") or ""
+        runs = d.get("episode_run_time") or []
+        minutes = int(runs[0]) if runs else 0
+        date = str(d.get("first_air_date") or "")
+    year = int(date[:4]) if date[:4].isdigit() else 0
+    return (tt if str(tt).startswith("tt") else ""), minutes, year
 
 
 def decode(text: str):
@@ -224,7 +308,55 @@ def main() -> int:
             write_fields(path, fields, token)
         written.update(todo_w)
 
-    todo = sorted(k for k in requested if due(k))
+    tmdb_token = os.environ.get("TMDB_TOKEN", "").strip()
+    day = today.strftime("%Y%m%d")
+    if tmdb_token:
+        def needs_tmdb(k: str) -> bool:
+            v = changes.get(k, base.get(k, ""))
+            if not v or v.startswith("?"):
+                return due(k)
+            tt, r, d, y = decode(v)
+            if tt and d and y:
+                return False  # complet
+            c = checked_of(v)
+            try:
+                return not c or (today - datetime.strptime(c, "%Y%m%d").replace(tzinfo=timezone.utc)).days >= TMDB_RETRY_DAYS
+            except ValueError:
+                return True
+        keys = sorted(k for k in requested if needs_tmdb(k))
+        log(f"à compléter par TMDB : {len(keys)}")
+        done_n, errors = 0, 0
+        with ThreadPoolExecutor(TMDB_WORKERS) as ex:
+            futures = {ex.submit(tmdb_lookup, k, tmdb_token): k for k in keys}
+            for fut in as_completed(futures):
+                k = futures[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    errors += 1
+                    if errors <= 3 or "401" in str(e):
+                        log("  TMDB :", e)
+                    if "401" in str(e):
+                        ex.shutdown(cancel_futures=True)
+                        break
+                    continue
+                old = changes.get(k, base.get(k, ""))
+                ot, orr, od, oy = decode(old) if old.startswith("tt") else ("", -1, 0, 0)
+                if res is None:
+                    tt, d, y = ot, od, oy
+                else:
+                    tt, d, y = res[0] or ot, res[1] or od, res[2] or oy
+                if tt:
+                    changes[k] = encode(tt, orr, d, y, day)
+                done_n += 1
+                if done_n % 1000 == 0:
+                    flush(changes)
+                    log(f"  TMDB : {done_n} / {len(keys)} (enregistré)")
+        flush(changes)
+        log(f"  TMDB : {done_n} titres vérifiés, {errors} erreurs")
+
+    # Wikidata : nouveaux titres que TMDB n'a pas reliés (ou tous, sans clé TMDB)
+    todo = sorted(k for k in requested if due(k) and not changes.get(k, "").startswith("tt"))
     log(f"à relier par Wikidata : {len(todo)}")
     lots = 0
     stopped = False
@@ -257,11 +389,19 @@ def main() -> int:
     ratings = load_ratings()
     log(f"notes IMDb : {len(ratings)} titres")
     merged = {**base, **changes}
+    linked = {decode(v)[0] for v in merged.values() if v and v.startswith("tt")}
+    try:
+        basics = load_basics(linked)
+        log(f"années et durées IMDb : {len(basics)} titres")
+    except Exception as e:  # fichier indisponible : on garde ce qu'on a
+        log("  title.basics :", e)
+        basics = {}
     for k, v in merged.items():
         if not v or v.startswith("?"):
             continue
         tt, r, d, y = decode(v)
-        new = encode(tt, ratings.get(tt, -1), d, y)
+        bd, by = basics.get(tt, (0, 0))
+        new = encode(tt, ratings.get(tt, -1), bd or d, by or y, checked_of(v))
         if new != base.get(k):
             changes[k] = new
         elif k in changes and changes[k] != new:

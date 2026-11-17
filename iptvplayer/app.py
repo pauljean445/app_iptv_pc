@@ -435,7 +435,7 @@ class MainWindow(QMainWindow):
         self.filter_timer = QTimer(self)
         self.filter_timer.setSingleShot(True)
         self.filter_timer.setInterval(200)
-        self.filter_timer.timeout.connect(self._apply_filter)
+        self.filter_timer.timeout.connect(lambda: (self._apply_filter(), self._to_top()))  # nouvelle recherche : en haut
 
         # Rafraîchit la liste quand des images arrivent (regroupé pour éviter de redessiner 50 fois)
         self.image_timer = QTimer(self)
@@ -1849,6 +1849,11 @@ class MainWindow(QMainWindow):
                 self._show_details(self.details_item)
 
     # ---- Onglets, vues et filtres ----------------------------------------- #
+    def _to_top(self):
+        """Liste de gauche et mosaïque remises en haut (nouvelle catégorie, nouvelle recherche)."""
+        self.list.scrollToTop()
+        self.grid.scrollToTop()
+
     def _set_tab(self, tab: str):
         if self.view != "list":
             self._leave_sub_view(restore=False)
@@ -1860,6 +1865,7 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentWidget(self.browse)
         self._populate_groups(self.tab_group.get(tab, ALL))
         self._apply_filter()
+        self._to_top()  # autre onglet : en haut (une entrée choisie ensuite y replace la liste)
         self._sync_grid()
 
 
@@ -1888,6 +1894,7 @@ class MainWindow(QMainWindow):
         if self.view == "list":
             self.tab_group[self.tab] = self.group_combo.currentData()
         self._apply_filter()
+        self._to_top()  # autre catégorie : autre liste, on repart du haut
         if self.model.reorderable:
             self.statusBar().showMessage("Glisse un favori pour changer l'ordre (ou Ctrl+↑ / Ctrl+↓)", 6000)
 

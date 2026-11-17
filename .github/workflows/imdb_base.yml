@@ -1,5 +1,6 @@
 # Base commune des notes IMDb (PC, TV, téléphone) : mise à jour chaque nuit par le compte « robot ».
-# Secrets du dépôt (Settings > Secrets and variables > Actions) : ROBOT_EMAIL, ROBOT_PASSWORD, HOUSEHOLDS.
+# Secrets du dépôt (Settings > Secrets and variables > Actions) : ROBOT_EMAIL, ROBOT_PASSWORD, HOUSEHOLDS,
+# TMDB_TOKEN (facultatif, recommandé : identifiants IMDb, durées et années complets).
 name: Notes IMDb
 
 on:
@@ -24,4 +25,5 @@ jobs:
           ROBOT_EMAIL: ${{ secrets.ROBOT_EMAIL }}
           ROBOT_PASSWORD: ${{ secrets.ROBOT_PASSWORD }}
           HOUSEHOLDS: ${{ secrets.HOUSEHOLDS }}
+          TMDB_TOKEN: ${{ secrets.TMDB_TOKEN }}
         run: python tools/imdb_job.py

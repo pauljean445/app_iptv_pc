@@ -81,7 +81,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from . import cast, cloud, downloads, library, power, sync, ui, update, vlc_loader
+from . import cast, cloud, downloads, imdb_base, library, power, sync, ui, update, vlc_loader
 from . import tracks as tracklib
 from .images import ImageLoader
 from .sources import catalog, omdb, playlist, xtream
@@ -96,6 +96,7 @@ MAX_RETRIES = 5
 SYNC_MS = 30_000        # synchro avec le compte du foyer : toutes les 30 s…
 SYNC_ROOT_EVERY = 4     # … et la liste des profils un passage sur 4 (2 min)
 TABS = [("live", "Direct"), ("movie", "Films"), ("series", "Séries"), ("replay", "Replays")]
+GRID_TABS = ("live", "movie", "series", "replay")  # onglets ouverts en mosaïque (un clic : liste + fiche / lecture)
 TAB_ICONS = {"live": "live", "movie": "film", "series": "series", "replay": "replay"}
 TAB_COUNT = {"live": "chaînes", "movie": "films", "series": "séries", "replay": "chaînes en replay"}
 SEARCH_TAB = len(TABS) + 1  # onglet « Recherche » (page à part), après Accueil et les onglets de contenu
@@ -114,6 +115,34 @@ PROGRAMS_TTL = 300  # secondes avant de redemander la liste des replays d'une ch
 def _norm(text: str) -> str:
     """Minuscules sans accents (recherche « serie » = « Série »)."""
     return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+
+
+def _runtime_text(it) -> str:
+    """Durée lisible (« 1 h 41 »). Titre présent dans la base IMDb commune : sa durée seulement (même source que
+    l'année et la note) ; sinon durée du fichier donnée par le fournisseur."""
+    minutes = getattr(it, "runtime", 0) or 0
+    if not minutes and it.duration:
+        parts = [p for p in str(it.duration).split(":") if p.isdigit()]
+        if len(parts) == 3:
+            minutes = int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 2:
+            minutes = int(parts[0])
+    if not minutes:
+        return str(it.duration or "") if it.kind == "series" else ""
+    return f"{minutes // 60} h {minutes % 60:02d}" if minutes >= 60 else f"{minutes} min"
+
+
+def _year_of(it) -> str:
+    """Année. Titre présent dans la base IMDb commune : son année (même source que la note et la durée) ; sinon
+    champ du fournisseur, ou l'année qui termine souvent le nom (« Titre (MULTI) FHD 2026 »)."""
+    if getattr(it, "imdb_year", 0):
+        return str(it.imdb_year)
+    return it.year or playlist.clean_title(it.name)[1]
+
+
+def _short_rating(it) -> str:
+    """Note IMDb des listes et mosaïques : « ★ 4.7 » (la mention IMDb est sur la fiche)."""
+    return f"★ {it.imdb_rating}" if getattr(it, "imdb_rating", "") else ""
 
 
 def _esc(text: str) -> str:
@@ -455,6 +484,12 @@ class MainWindow(QMainWindow):
         self.sync_timer = QTimer(self)
         self.sync_timer.setInterval(SYNC_MS)
         self.sync_timer.timeout.connect(self._sync)
+        # Base IMDb commune : remplissage / notes du jour toutes les 6 h (le fichier IMDb change chaque jour)
+        self._imdb_busy = False
+        self.imdb_timer = QTimer(self)
+        self.imdb_timer.setInterval(6 * 3600 * 1000)
+        self.imdb_timer.timeout.connect(self._fill_imdb_base)
+        self.imdb_timer.start()
         self._sync_busy = False
         self._sync_round = 0              # passage n° 0, 4, 8… : liste des profils comprise
         self._sync_error_shown = False
@@ -629,6 +664,8 @@ class MainWindow(QMainWindow):
         self.details.alt_btn.clicked.connect(lambda: self._details_action("alt"))
         self.details.fav_btn.clicked.connect(lambda: self._details_action("fav"))
         self.details.dl_btn.clicked.connect(self._details_download)
+        self._ep_season: dict = {}  # saison affichée sur la fiche, par série
+        self.details.episodes.seasonChosen.connect(self._on_season_chosen)
         self.downloads = downloads.manager()  # commun à toute l'appli (continue pendant un changement de profil)
         self.downloads.changed.connect(self._update_dl_btn)
 
@@ -636,6 +673,14 @@ class MainWindow(QMainWindow):
         self.count_label.setObjectName("countLabel")
         self.count_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
+        self.grid_btn = QPushButton(ui.icon("chevron_left"), "Retour")
+        self.grid_btn.setObjectName("backBtn")
+        self.grid_btn.setFocusPolicy(Qt.NoFocus)
+        self.grid_btn.setToolTip("Revenir à la mosaïque de l'onglet")
+        self.grid_btn.clicked.connect(self.show_grid)
+        self.grid_btn.hide()
+        self.left_layout = lv
+        lv.addWidget(self.grid_btn, 0, Qt.AlignLeft)
         lv.addWidget(self.nav_row)
         lv.addWidget(self.search)
         lv.addWidget(self.group_combo)
@@ -847,6 +892,27 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.home)
         self.pages.addWidget(self.browse)
         self.pages.addWidget(self.search_page)
+
+        # Mosaïque des onglets Direct / Films / Séries (affichage par défaut) : recherche et catégories au-dessus
+        # (les mêmes champs que le panneau gauche, déplacés ici), vignettes de la liste filtrée
+        self.grid_page = QWidget()
+        self.grid_page.setObjectName("browseLeft")
+        self.grid_page.setAttribute(Qt.WA_StyledBackground, True)
+        gv = QVBoxLayout(self.grid_page)
+        gv.setContentsMargins(16, 10, 10, 4)
+        gv.setSpacing(8)
+        self.grid_bar = QHBoxLayout()
+        self.grid_bar.setSpacing(10)
+        gv.addLayout(self.grid_bar)
+        self.grid = ui.GridView(self.images, self._grid_tile)
+        self.grid.setModel(self.model)
+        self.grid.clicked.connect(self._on_grid_clicked)
+        gv.addWidget(self.grid, 1)
+        self.grid_count = QLabel()
+        self.grid_count.setObjectName("countLabel")
+        gv.addWidget(self.grid_count)
+        self.grid_wanted = True  # mosaïque quand on ouvre un onglet ; liste après un clic sur une vignette
+        self.pages.addWidget(self.grid_page)
 
         central = QWidget()
         cv = QVBoxLayout(central)
@@ -1109,14 +1175,81 @@ class MainWindow(QMainWindow):
         self.tabs.blockSignals(False)
         self._update_now_playing()
 
-    def show_browse(self, tab: str):
+    def show_browse(self, tab: str, grid: bool = True):
+        """Onglet tab ; grid : en mosaïque (Direct, Films, Séries), sinon liste + fiche / lecture."""
+        self.grid_wanted = grid
         self.pages.setCurrentWidget(self.browse)
         if tab != self.tab or self.tabs.currentIndex() == 0:
             self._set_tab(tab)
+        self._sync_grid()
         self._update_now_playing()
+
+    # ---- Mosaïque ------------------------------------------------------------ #
+    def _sync_grid(self):
+        """Mosaïque ou liste selon grid_wanted / l'onglet / la vue ; recherche et catégories suivent."""
+        on = (self.grid_wanted and self.tab in GRID_TABS and self.view == "list"
+              and self.pages.currentWidget() in (self.browse, self.grid_page))
+        if on:
+            if self.grid_bar.indexOf(self.search) < 0:
+                for w in (self.search, self.group_combo):
+                    self.left_layout.removeWidget(w)
+                self.grid_bar.addWidget(self.search, 3)
+                self.grid_bar.addWidget(self.group_combo, 2)
+            self.grid.set_mode(poster=self.tab in ("movie", "series"))
+            if self.pages.currentWidget() is not self.grid_page:
+                self.pages.setCurrentWidget(self.grid_page)
+                cur = self.list.currentIndex()
+                if cur.isValid():
+                    self.grid.scrollTo(cur, QListView.PositionAtCenter)
+        else:
+            if self.left_layout.indexOf(self.search) < 0:
+                for w in (self.search, self.group_combo):
+                    self.grid_bar.removeWidget(w)
+                at = self.left_layout.indexOf(self.nav_row) + 1
+                self.left_layout.insertWidget(at, self.search)
+                self.left_layout.insertWidget(at + 1, self.group_combo)
+            if self.pages.currentWidget() is self.grid_page:
+                self.pages.setCurrentWidget(self.browse)
+        self.grid_btn.setVisible(not on and self.tab in GRID_TABS and self.view == "list")
+
+    def _stop_on_leave(self):
+        """Changement d'onglet, retour à la mosaïque : la lecture s'arrête (sinon le direct restait dans le lecteur
+        d'un autre onglet), sauf pendant une diffusion sur un appareil Cast."""
+        if self.cast_target is not None:
+            return
+        if self._auto_next is not None:
+            self._cancel_auto_next()
+        if self.want_playing or self._is_playing():
+            self.stop()
+
+    def show_grid(self):
+        """Bouton « Retour » : retour à la mosaïque de l'onglet (la lecture s'arrête, sauf diffusion Cast)."""
+        self._stop_on_leave()
+        self.grid_wanted = True
+        self._sync_grid()
+        self.grid.setFocus()
+
+    def _grid_tile(self, index) -> "ui.Tile":
+        it = self.model.item(index.row())
+        r = self._row(it)
+        title = r.title + ("  ★" if r.fav else "")
+        return ui.Tile(it, title, r.subtitle, r.progress)
+
+    def _on_grid_clicked(self, index):
+        """Vignette : affichage liste + fiche (film, série) ou lecture (chaîne), bouton « Mosaïque » pour revenir."""
+        if not index.isValid() or index.row() >= len(self.model.items):
+            return
+        it = self.model.item(index.row())
+        self.grid_wanted = False
+        self._sync_grid()
+        self._select_key(it.key, center=True)
+        if it.kind == "live" and self.tab != "replay":  # Replays : la fiche de la chaîne (programmes) suffit
+            self.play_item(it)
+        self.list.setFocus()
 
     def show_player(self):
         """Revient à la lecture en cours (onglet où elle a été lancée, vidéo affichée)."""
+        self.grid_wanted = False
         tab = getattr(self, "play_tab", self.tab)
         if tab != self.tab:
             self._set_tab(tab)
@@ -1125,6 +1258,7 @@ class MainWindow(QMainWindow):
             self.tabs.blockSignals(True)
             self.tabs.setCurrentIndex([k for k, _ in TABS].index(self.tab) + 1)
             self.tabs.blockSignals(False)
+        self._sync_grid()
         self.right_stack.setCurrentWidget(self.player_panel)
         self._update_now_playing()
 
@@ -1183,7 +1317,7 @@ class MainWindow(QMainWindow):
 
     def _on_tile(self, kind: str, it):
         """Clic sur une vignette de l'accueil : on lance directement."""
-        self.show_browse(kind)
+        self.show_browse(kind, grid=False)
         self._select_key(it.key, center=True)
         if kind == "live":
             self.play_item(it)
@@ -1210,9 +1344,13 @@ class MainWindow(QMainWindow):
     def _update_right(self):
         """Partie droite : la vidéo pendant une lecture, sinon la fiche de l'élément sélectionné."""
         it = self.details_item
-        if self._is_playing() or self._auto_next is not None or it is None or it.kind == "live":
+        live_here = it is not None and it.kind == "live" and self.tab != "replay"
+        playing = (self._is_playing() or self._auto_next is not None) and not self._other_replay_channel(it)
+        if playing or it is None or live_here:
             self.right_stack.setCurrentWidget(self.player_panel)
         else:
+            if it.kind in ("series", "live") and self.right_stack.currentWidget() is not self.details:
+                self._show_episodes(it)  # vu / en cours mis à jour après la lecture
             self.right_stack.setCurrentWidget(self.details)
 
     def _action(self, group, text, shortcut, slot):
@@ -1268,7 +1406,7 @@ class MainWindow(QMainWindow):
              ("fullscreen", "Plein écran", self.toggle_fullscreen)],
             [[("account", "Compte du foyer", "", self.open_account),
               ("download", "Téléchargements", "", self.open_downloads),
-              ("star", "Notes IMDb (clé OMDb)", "", self.set_omdb_key),
+              ("star", "Clé OMDb (facultative)", "", self.set_omdb_key),
               ("keyboard", "Raccourcis clavier", "?", self.show_shortcuts),
               ("download", "Mise à jour", f"v{__version__}", lambda: self.check_update(silent=False))],
              [("quit", "Quitter", "Ctrl+Q", self.close)]])
@@ -1438,6 +1576,11 @@ class MainWindow(QMainWindow):
             if it.kind == "live" and it.archive_days > 0:
                 by_tab["replay"].append(it)
         self.by_tab, self.by_key = by_tab, by_key
+        for k, r in omdb.known_ratings().items():  # notes IMDb déjà trouvées (fiches ouvertes)
+            if k in by_key:
+                by_key[k].imdb_rating = r
+        self._apply_imdb_base()
+        QTimer.singleShot(4000, self._fill_imdb_base)
         self.tab_groups = {k: list(dict.fromkeys(i.group_label for i in v)) for k, v in by_tab.items()}
 
         self.tabs.blockSignals(True)
@@ -1636,6 +1779,48 @@ class MainWindow(QMainWindow):
         except cloud.CloudError:
             pass  # envoyé au prochain lancement
 
+    # ---- Base IMDb commune (notes et durées pour le PC, la TV et le téléphone) --------- #
+    def _apply_imdb_base(self):
+        """Notes IMDb et durées de la base commune sur les entrées du catalogue."""
+        base = imdb_base.base()
+        for it in self.by_key.values():
+            entry = base.get(imdb_base.key_of(it))
+            if entry is not None:  # relié à IMDb
+                tt, r, d, y = entry
+                it.imdb_id = tt
+                it.imdb_rating = f"{r / 10:.1f}" if r >= 0 else ""
+                it.runtime = d
+                it.imdb_year = y
+
+    def _fill_imdb_base(self):
+        """Arrière-plan : lecture de la base commune des notes, et inscription (pour la tâche de la nuit) des titres
+        du catalogue qui n'y sont pas encore."""
+        if self._imdb_busy or not self.cloud.signed_in or not self.by_key:
+            return
+        self._imdb_busy = True
+        lib = self.library
+        first = [self.by_key[k] for t in ("movie", "series")
+                 for k in [*lib.favorite_keys(t), *lib.recent_keys(t)] if k in self.by_key]
+        wanted = [imdb_base.key_of(it) for it in [*first, *self.by_tab.get("movie", []), *self.by_tab.get("series", [])]]
+        wanted = [k for k in wanted if k]
+        session = self.cloud
+
+        def done(_=None):
+            self._imdb_busy = False
+            self._imdb_progress()
+
+        run_async(lambda: imdb_base.base().sync(session, wanted), done, lambda _m: done())
+
+    def _imdb_progress(self):
+        self._apply_imdb_base()
+        self.model.refresh()
+        if self.pages.currentWidget() is self.grid_page:
+            self.grid.viewport().update()
+        if self.details_item is not None and self.right_stack.currentWidget() is self.details:
+            d, it = self.details, self.details_item
+            if it.kind in ("movie", "series") and it.imdb_rating and "IMDb" not in d.meta.text():
+                self._show_details(it)
+
     def _library_changed(self):
         """Favoris, reprises… modifiés (réinitialisation, synchro) : listes, accueil et fiche redessinés."""
         if self.view == "list":  # catégories masquées depuis un autre appareil
@@ -1650,9 +1835,10 @@ class MainWindow(QMainWindow):
 
     def set_omdb_key(self):
         key, ok = QInputDialog.getText(
-            self, "Notes IMDb",
-            "Clé API OMDb (gratuite sur https://www.omdbapi.com/apikey.aspx).\n"
-            "Laisser vide pour n'afficher que la note du fournisseur.",
+            self, "Clé OMDb",
+            "Clé API OMDb, facultative (gratuite sur https://www.omdbapi.com/apikey.aspx).\n"
+            "Les notes IMDb s'affichent sans clé ; la clé permet en plus de retrouver les titres inconnus\n"
+            "de Wikidata et d'avoir un résumé (en anglais) quand le fournisseur n'en donne pas.",
             QLineEdit.Normal, self.cfg.get("omdb_api_key", ""))
         if ok:
             self.cfg["omdb_api_key"] = key.strip()
@@ -1674,9 +1860,17 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentWidget(self.browse)
         self._populate_groups(self.tab_group.get(tab, ALL))
         self._apply_filter()
+        self._sync_grid()
 
 
     def _on_tab_changed(self, index: int):
+        self._stop_on_leave()
+        # Nouvel onglet : recherche vide (le champ est commun à tous les onglets)
+        self.filter_timer.stop()
+        if self.search.text():
+            self.search.blockSignals(True)
+            self.search.clear()
+            self.search.blockSignals(False)
         if index == 0:
             self.show_home()
         elif 1 <= index <= len(TABS):
@@ -1879,6 +2073,7 @@ class MainWindow(QMainWindow):
         self.list.set_reorderable(self.view == "list" and group == FAV and not text and len(items) > 1)
         self.model.set_items(items)
         self.count_label.setText(f"{len(items)} / {len(base)}")
+        self.grid_count.setText(f"{len(items)} / {len(base)}")
         if not self._select_current() and keep:
             self._select_key(keep)
         if self.list.currentIndex().row() < 0:
@@ -1935,7 +2130,8 @@ class MainWindow(QMainWindow):
             found = [i for i in self.by_tab.get(kind, []) if text in self._norm_name(i)]
             out = []
             for it in found[:SEARCH_MAX]:
-                sub = " · ".join(x for x in (it.year, f"★ {it.rating}" if it.rating else "") if x) or it.group_label
+                sub = " · ".join(x for x in (_year_of(it), _short_rating(it), _runtime_text(it) if it.kind == "movie" else "")
+                                 if x)
                 pos, length = lib.resume_position(it.key), lib.progress.get(it.key, {}).get("len", 0)
                 out.append(ui.Tile(it, it.name, sub, pos / length if pos and length else -1))
             return out, len(found)
@@ -2013,11 +2209,9 @@ class MainWindow(QMainWindow):
         self._card_tracks(dlg, kind, it, failed)
         pm = self.images.pixmap(it.logo, dlg.poster.width(), dlg.poster.height(), large=True) if it.logo else None
         dlg.set_poster(pm, "…" if it.logo and not self.images.has_failed(it.logo, True) else "Pas d'image")
-        meta = [_esc(x) for x in (it.year, it.genre, it.duration) if x]
+        meta = [_esc(x) for x in (_year_of(it), it.genre, _runtime_text(it)) if x]
         if it.imdb_rating:
-            meta.append(f"<b>IMDb ★ {_esc(it.imdb_rating)}</b>")
-        elif it.rating:
-            meta.append(f"★ {_esc(it.rating)}/10")
+            meta.append(f"<b>IMDb ★ {_esc(it.imdb_rating)}</b>/10")
         credits = []
         if it.director:
             credits.append(f"<b>Réalisation</b> : {_esc(it.director)}")
@@ -2074,7 +2268,7 @@ class MainWindow(QMainWindow):
     def _show_in_tab(self, kind: str, it: playlist.Item):
         """« Fiche complète » : la fiche dans l'onglet Films / Séries (langues, épisodes…)."""
         it = self.by_key.get(it.key, it)
-        self.show_browse(kind)
+        self.show_browse(kind, grid=False)
         if self.view != "list":
             self._leave_sub_view(restore=False)
         self.search.blockSignals(True)
@@ -2101,6 +2295,7 @@ class MainWindow(QMainWindow):
         self.view_items = items
         self.nav_title.setText(parent.name)
         self.nav_row.show()
+        self._sync_grid()  # sous-vue (épisodes, programmes) : pas de bouton « Mosaïque »
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
@@ -2117,6 +2312,7 @@ class MainWindow(QMainWindow):
         self.view_parent = None
         self.view_items = []
         self.nav_row.hide()
+        self._sync_grid()
         if restore:
             st = self.back_state
             self.search.blockSignals(True)
@@ -2151,8 +2347,9 @@ class MainWindow(QMainWindow):
             if self.tab == "replay" and self.view == "list":
                 sub += f" · replay {it.archive_days} j"
         else:  # film, série
-            bits = [it.year, f"★ {it.rating}" if it.rating else "", it.genre]
-            sub = " · ".join(b for b in bits if b) or it.group_label
+            # Liste et mosaïque : année · ★ note IMDb · durée, rien d'autre (le reste est sur la fiche)
+            bits = [_year_of(it), _short_rating(it), _runtime_text(it) if it.kind == "movie" else ""]
+            sub = " · ".join(b for b in bits if b)
             entry = lib.recent.get(it.key) if it.kind == "series" else None
             if entry:
                 sub = "En cours" + (f" · {entry['last_label']}" if entry.get("last_label") else "")
@@ -2170,6 +2367,10 @@ class MainWindow(QMainWindow):
 
     def _on_images_ready(self):
         self.list.viewport().update()
+        if self.details.episodes.isVisible():
+            self.details.episodes.refresh_images()
+        if self.pages.currentWidget() is self.grid_page:
+            self.grid.viewport().update()
         if self.pages.currentWidget() is self.home:
             self.home.refresh_images()
         if self.details_item is not None:
@@ -2178,16 +2379,31 @@ class MainWindow(QMainWindow):
     # ---- Fiche détaillée --------------------------------------------------- #
     def _on_current_changed(self, current, _previous):
         if current.isValid() and current.row() < len(self.model.items):
-            self._show_details(self.model.item(current.row()))
+            it = self.model.item(current.row())
+            if self._other_replay_channel(it) and self.cast_target is None and (self.want_playing or self._is_playing()):
+                self.stop()  # Replays : une autre chaîne choisie pendant un programme -> sa fiche (programmes)
+            self._show_details(it)
         else:
             self._show_details(None)
+
+    def _other_replay_channel(self, it) -> bool:
+        """Onglet Replays : it est une chaîne autre que celle de la lecture en cours (programme ou direct)."""
+        if it is None or it.kind != "live" or self.tab != "replay":
+            return False
+        cur = self.current
+        return cur is None or (cur.key != it.key and (cur.parent is None or cur.parent.key != it.key))
 
     def _show_details(self, it: playlist.Item | None):
         self.details_item = it
         d = self.details
         self._update_right()
+        if it is not None and it.kind == "live" and self.tab == "replay":
+            self._show_channel_details(it)
+            return
         if it is None or it.kind == "live":
             return
+        d.plot.show()
+        d.credits.show()
         d.verticalScrollBar().setValue(0)
         d.title.setText(playlist.episode_label(it) if it.kind == "episode" else it.name)
         d.plot.setText(self._plot_html(it))
@@ -2197,11 +2413,9 @@ class MainWindow(QMainWindow):
             meta.append(xtream.day_label(it.start))
         if it.kind == "episode" and (it.season or it.episode):
             meta.append(f"Saison {it.season} · épisode {it.episode}")
-        meta += [_esc(x) for x in (it.year, it.genre, it.duration) if x]
+        meta += [_esc(x) for x in ((_year_of(it), it.genre, _runtime_text(it)) if it.kind in ("movie", "series") else (it.year, it.genre, it.duration)) if x]
         if it.imdb_rating:
-            meta.append(f"<b>IMDb ★ {_esc(it.imdb_rating)}</b>")
-        elif it.rating:
-            meta.append(f"★ {_esc(it.rating)}/10")
+            meta.append(f"<b>IMDb ★ {_esc(it.imdb_rating)}</b>/10")
         d.meta.setText(" · ".join(meta))
         credits = []
         if it.director:
@@ -2234,15 +2448,144 @@ class MainWindow(QMainWindow):
                 ep, pos = target
                 label = f"S{ep.season:02d}E{ep.episode:02d}"
                 d.play_btn.setText(f"▶ Reprendre {label} à {fmt_time(pos)}" if pos else f"▶ Lire {label}")
-                d.alt_btn.setText("Voir les épisodes")
-                d.alt_btn.show()
+            elif it.episodes:
+                first = it.episodes[0]
+                d.play_btn.setText(f"▶ Lire S{first.season:02d}E{first.episode:02d}")
             else:
-                d.play_btn.setText("Voir les épisodes")
+                d.play_btn.setText("▶ Lire")
         else:  # programme de replay
             d.play_btn.setText("▶ Lire")
 
+        self._show_episodes(it)
         self._show_tracks(it)
         self._fetch_details(it)
+
+    # ---- Replays : fiche de la chaîne, journées et programmes ----------------- #
+    def _show_channel_details(self, ch: playlist.Item):
+        """Onglet Replays : la chaîne en fiche (comme une série), journées en boutons, programmes en lignes."""
+        d = self.details
+        d.verticalScrollBar().setValue(0)
+        d.title.setText(ch.name)
+        bits = [f"Replay sur {ch.archive_days} jours" if ch.archive_days else "Replay", _esc(ch.group_label)]
+        d.meta.setText(" · ".join(b for b in bits if b))
+        d.plot.hide()
+        d.credits.hide()
+        self._update_poster(ch)
+        d.alt_btn.hide()
+        d.dl_btn.hide()
+        d.fav_btn.setVisible(True)
+        fav = self.library.is_favorite("replay", ch.key)
+        d.fav_btn.setText("★  Favori" if fav else "☆  Favori")
+        d.fav_btn.setToolTip("Retirer des favoris  (Ctrl+D)" if fav else "Ajouter aux favoris  (Ctrl+D)")
+        d.play_btn.setText("▶ Regarder en direct")
+        d.set_tracks_message("")
+        self._show_program_list(ch)
+
+    def _show_program_list(self, ch: playlist.Item):
+        box = self.details.episodes
+        cached = ch.extra.get("programs")
+        if not cached or time.time() - cached[0] >= PROGRAMS_TTL:
+            if ch.extra.get("_prog_error"):
+                box.set_message(f"Replays indisponibles : {ch.extra['_prog_error']}")
+            else:
+                box.set_message("Chargement des programmes…")
+                if not ch.extra.get("_prog_loading"):
+                    self.open_programs(ch)
+            return
+        programs = cached[1]
+        if not programs:
+            box.set_message("Aucun programme disponible en replay sur cette chaîne.")
+            return
+        days = list(dict.fromkeys(p.group for p in programs))  # du plus récent au plus ancien
+        day = self._ep_season.get(ch.key)
+        if day not in days:
+            day = days[0]
+        now = time.time()
+        rows = []
+        for p in (p for p in programs if p.group == day):
+            playing = self.current is not None and p.key == self.current.key and self._is_playing()
+            desc = p.plot if len(p.plot) <= 100 else p.plot[:97].rstrip() + "…"  # 2 lignes (texte complet au survol)
+            rows.append({
+                "kind": "program", "title": p.extra.get("title") or p.name,
+                "start": time.strftime("%H:%M", time.localtime(p.start)),
+                "end": time.strftime("%H:%M", time.localtime(p.end)),
+                "duration": p.duration, "live": p.end > now, "playing": playing,
+                "desc": desc, "full_desc": p.plot if len(p.plot) > 100 else "",
+                "play": lambda p=p: self.play_item(p),
+                "menu": lambda gpos, p=p: self._program_menu(p, gpos),
+            })
+        box.set_episodes(days, day, rows, self.images, head="Programmes en replay", chip=str)
+
+    def _program_menu(self, p: playlist.Item, gpos):
+        menu = QMenu(self)
+        menu.addAction("Lire", lambda: self.play_item(p))
+        menu.exec(gpos)
+
+    # ---- Épisodes sur la fiche d'une série ------------------------------------ #
+    def _show_episodes(self, it: playlist.Item | None):
+        box = self.details.episodes
+        if it is not None and it.kind == "live" and self.tab == "replay":
+            self._show_program_list(it)
+            return
+        if it is None or it.kind != "series":
+            box.set_message("")
+            return
+        if it.episodes is None:
+            box.set_message("Chargement des épisodes…")
+            self.tracks_timer.start()  # _probe_details charge les épisodes
+            return
+        if not it.episodes:
+            box.set_message("Aucun épisode disponible.")
+            return
+        seasons = sorted({e.season for e in it.episodes})
+        season = self._ep_season.get(it.key)
+        if season not in seasons:
+            target = self._series_resume_target(it)
+            season = target[0].season if target else seasons[0]
+        lib = self.library
+        rows = []
+        for ep in (e for e in it.episodes if e.season == season):
+            label = playlist.episode_label(ep)
+            pos = lib.resume_position(ep.key)
+            length = lib.progress.get(ep.key, {}).get("len", 0)
+            watched = lib.is_watched(ep)
+            playing = self.current is not None and ep.key == self.current.key and self._is_playing()
+            if playing:
+                sub = "▶ En lecture"
+            elif watched:
+                sub = "✓ Vu"
+            elif pos:
+                sub = f"En cours · {fmt_time(pos)}"
+            else:
+                sub = ep.duration or ""
+            rows.append({
+                "title": label, "sub": sub, "accent": playing or watched or bool(pos),
+                "progress": pos / length if pos and length else -1, "logo": ep.logo if ep.logo != it.logo else "",
+                "play": lambda ep=ep: self.play_item(ep, resume=True),
+                "menu": lambda gpos, ep=ep: self._episode_menu(ep, gpos),
+                "download": (lambda ep=ep: self._queue_downloads([ep])) if ep.url else None,
+            })
+        box.set_episodes(seasons, season, rows, self.images)
+
+    def _on_season_chosen(self, season: int):
+        it = self.details_item
+        if it is not None and it.kind in ("series", "live"):
+            self._ep_season[it.key] = season  # saison, ou journée des replays
+            self._show_episodes(it)
+
+    def _episode_menu(self, ep: playlist.Item, gpos):
+        lib = self.library
+        menu = QMenu(self)
+        menu.addAction("Lire", lambda: self.play_item(ep, resume=True))
+        if lib.resume_position(ep.key):
+            menu.addAction("Lire depuis le début", lambda: self.play_item(ep, resume=False))
+        if lib.is_watched(ep):
+            menu.addAction("Marquer comme non vu", lambda: self._set_watched(ep, False))
+        else:
+            menu.addAction("Marquer comme vu", lambda: self._set_watched(ep, True))
+        if ep.url:
+            menu.addAction("Télécharger l'épisode", lambda: self._queue_downloads([ep]))
+        menu.exec(gpos)
 
     def _lang_target(self, it: playlist.Item):
         """Fichier dont la fiche montre les langues : le film, l'épisode, ou pour une série l'épisode
@@ -2319,9 +2662,6 @@ class MainWindow(QMainWindow):
     def _launch_with_audio(self, it: playlist.Item, target: playlist.Item, t):
         """Bouton de langue de la fiche : mémorise la langue puis lance le film / l'épisode."""
         self.library.set_pref(self._pref_key(target), "audio", t.pref())
-        if it.kind == "series":
-            self.open_series(it)  # vue des épisodes, comme un double-clic
-            self._select_key(target.key)
         self.play_item(target, resume=True)
 
     def _choose_subtitles(self, it: playlist.Item, target: playlist.Item, t):
@@ -2363,7 +2703,7 @@ class MainWindow(QMainWindow):
         need_info = self.client is not None and it.kind == "movie" and not it.info_loaded
         need_eps = (self.client is not None and it.kind == "series" and it.episodes is None
                     and it.key in self.library.recent)
-        need_omdb = bool(key) and it.kind in ("movie", "series") and "omdb" not in it.extra
+        need_omdb = it.kind in ("movie", "series") and "omdb" not in it.extra  # note IMDb (clé OMDb facultative)
         if it.extra.get("_loading") or not (need_info or need_eps or need_omdb):
             return
         it.extra["_loading"] = True
@@ -2383,10 +2723,18 @@ class MainWindow(QMainWindow):
                     errors.append(str(exc))
             if need_omdb:
                 title, year = playlist.clean_title(it.name)
+                if it.kind == "series" and not it.extra.get("tmdb_id") and it.episodes is None and client is not None:
+                    try:  # l'identifiant TMDB d'une série arrive avec ses épisodes
+                        client.load_episodes(it)
+                    except Exception:
+                        pass
                 try:
-                    r = omdb.lookup(key, [it.extra.get("o_name", ""), title], it.year or year, it.kind)
-                    it.imdb_rating = r.get("rating", "")
-                    it.imdb_id = r.get("imdb_id", "")
+                    r = omdb.lookup(key, [it.extra.get("o_name", ""), title], it.year or year, it.kind,
+                                    tmdb_id=it.extra.get("tmdb_id", ""))
+                    it.imdb_rating = r.get("rating", "") or it.imdb_rating
+                    omdb.remember_rating(it.key, it.imdb_rating)
+                    it.imdb_id = r.get("imdb_id", "") or it.imdb_id
+
                     it.plot = it.plot or r.get("plot", "")
                     it.logo = it.logo or r.get("poster", "")
                     it.extra["omdb"] = True
@@ -2418,11 +2766,9 @@ class MainWindow(QMainWindow):
         elif it.kind in RESUMABLE:
             self.play_item(it, resume=(which == "play"))
         elif it.kind == "series":
-            target = self._series_resume_target(it)
-            if which == "play" and target is not None:
-                self.open_series(it, play_resume=True)
-            else:
-                self.open_series(it)
+            self.open_series(it, play_resume=which == "play")
+        elif it.kind == "live":
+            self.play_item(it)
         elif it.kind == "program":
             self.play_item(it)
 
@@ -2502,8 +2848,10 @@ class MainWindow(QMainWindow):
         for it in items:
             if not it.url:
                 continue
-            label = it.name if it.kind == "movie" else f"{it.parent.name if it.parent else ''} · {playlist.episode_label(it)}"
-            entries.append((label, it.url, self._download_path(base, it)))
+            show = playlist.clean_title(it.parent.name)[0] if it.kind == "episode" and it.parent else ""
+            label = it.name if it.kind == "movie" else f"{show} · {playlist.episode_label(it)}"
+            info = {"kind": "episode", "show": show, "season": it.season} if it.kind == "episode" else {}
+            entries.append((label, it.url, self._download_path(base, it), info))
         added = self.downloads.add(entries)
         if added:
             self.statusBar().showMessage(
@@ -2597,7 +2945,7 @@ class MainWindow(QMainWindow):
             menu.addAction("Voir les replays", lambda: self.open_programs(it))
             menu.addAction("Regarder en direct", lambda: self.play_item(it))
         elif it.kind == "series":
-            menu.addAction("Voir les épisodes", lambda: self.open_series(it))
+            menu.addAction("Lire", lambda: self.open_series(it, play_resume=True))
         else:
             menu.addAction("Lire", lambda: self.play_item(it))
             if it.kind in RESUMABLE and lib.resume_position(it.key):
@@ -2637,6 +2985,8 @@ class MainWindow(QMainWindow):
             lib.set_unwatched(ep)
         lib.save()
         self.model.refresh()
+        if self.details_item is not None and self.details_item.kind == "series":
+            self._show_details(self.details_item)
 
     def _remove_recent(self, key: str):
         it = self.by_key.get(key)
@@ -2653,7 +3003,7 @@ class MainWindow(QMainWindow):
             return
         it = self.model.item(index.row())
         if it.kind == "series":
-            self.open_series(it)
+            self.open_series(it, play_resume=True)  # double-clic / Entrée : reprise (épisodes sur la fiche)
         elif it.kind == "live" and self.tab == "replay" and self.view == "list":
             self.open_programs(it)
         else:
@@ -2688,16 +3038,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Aucun épisode disponible pour {show.name}", 6000)
             return
         target = self._series_resume_target(show)
-        entry = self.library.recent.get(show.key) or {}
-        select = target[0].key if target else entry.get("last_ep")
-        self._enter_sub_view("episodes", show, show.episodes, select)
-        n_seasons = len({e.season for e in show.episodes})
-        self.statusBar().showMessage(
-            f"{show.name} : {len(show.episodes)} épisodes, {n_seasons} saison(s)", 6000)
-        if play_resume and target is not None:
-            self.play_item(target[0], resume=True)
+        if self.details_item is not None and self.details_item.key == show.key:
+            self._show_details(self.details_item)  # épisodes sur la fiche
+        if play_resume:
+            self.play_item(target[0] if target else show.episodes[0], resume=True)
 
     def open_programs(self, channel: playlist.Item):
+        if channel.extra.get("_prog_loading"):
+            return  # déjà en cours : la fiche se remplira à l'arrivée
         cached = channel.extra.get("programs")
         if cached and time.time() - cached[0] < PROGRAMS_TTL:
             self._show_programs(channel, cached[1])
@@ -2711,26 +3059,28 @@ class MainWindow(QMainWindow):
             client, channel.stream_id = derived
         self._open_token = channel.key
         self.statusBar().showMessage(f"Chargement des replays : {channel.name}…")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        channel.extra["_prog_loading"] = True
+        channel.extra.pop("_prog_error", None)
 
         def done(programs):
-            QApplication.restoreOverrideCursor()
+            channel.extra["_prog_loading"] = False
             channel.extra["programs"] = (time.time(), programs)
-            if self._open_token == channel.key:
-                self._show_programs(channel, programs)
+            self.statusBar().clearMessage()
+            self._show_programs(channel, programs)
 
         def failed(msg):
-            QApplication.restoreOverrideCursor()
+            channel.extra["_prog_loading"] = False
+            channel.extra["_prog_error"] = msg
             self.statusBar().showMessage(f"Impossible de charger les replays : {msg}", 8000)
+            if self.details_item is not None and self.details_item.key == channel.key:
+                self.details.episodes.set_message(f"Replays indisponibles : {msg}")
 
         run_async(lambda: client.archive_programs(channel), done, failed)
 
     def _show_programs(self, channel: playlist.Item, programs: list):
-        if not programs:
-            self.statusBar().showMessage(f"Aucun programme disponible en replay sur {channel.name}", 6000)
-            return
-        self._enter_sub_view("programs", channel, programs)
-        self.statusBar().showMessage(f"{channel.name} : {len(programs)} programmes en replay", 6000)
+        """Programmes prêts : ils s'affichent sur la fiche de la chaîne (journées en boutons)."""
+        if self.details_item is not None and self.details_item.key == channel.key:
+            self._show_details(self.details_item)
 
     # ---- Lecture --------------------------------------------------------- #
     def play_item(self, it: playlist.Item, resume=True):

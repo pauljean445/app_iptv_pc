@@ -56,6 +56,9 @@ class Item:
     info_loaded: bool = False      # descriptif détaillé déjà récupéré
     imdb_rating: str = ""
     imdb_id: str = ""
+    tmdb: str = ""              # numéro TMDB (fourni par le fournisseur) : clé de la base IMDb commune
+    runtime: int = 0            # durée en minutes (base IMDb commune)
+    imdb_year: int = 0          # année de sortie (base IMDb commune)
     norm: str = ""              # nom en minuscules sans accents (recherche), calculé à la demande
     extra: dict = field(default_factory=dict)
 

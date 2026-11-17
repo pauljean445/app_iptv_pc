@@ -647,6 +647,20 @@ class DownloadsDialog(CardDialog):
         row.addWidget(opener)
         row.addWidget(change)
         self.body.addLayout(row)
+        # Filtre : tout / films / séries
+        self._filter = "all"
+        frow = QHBoxLayout()
+        frow.setSpacing(8)
+        self._filter_btns = {}
+        for key, label in (("all", "Tout"), ("movie", "Films"), ("episode", "Séries")):
+            b = QPushButton(label)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _=False, k=key: self._set_filter(k))
+            frow.addWidget(b)
+            self._filter_btns[key] = b
+        frow.addStretch(1)
+        self.body.addLayout(frow)
+        self._style_filters()
         self.list = QVBoxLayout()
         self.list.setSpacing(6)
         box = QWidget()
@@ -656,7 +670,7 @@ class DownloadsDialog(CardDialog):
         area.setWidgetResizable(True)
         area.setFrameShape(QFrame.NoFrame)
         area.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
-        area.setMinimumHeight(260)
+        area.setMinimumHeight(380)
         self.body.addWidget(area)
         note = QLabel("Un fichier à la fois : chaque téléchargement utilise une connexion de ton abonnement IPTV "
                       "(si ton abonnement n'en permet qu'une, la lecture peut être refusée pendant ce temps). "
@@ -667,8 +681,25 @@ class DownloadsDialog(CardDialog):
         self.add_buttons(("Effacer les terminés", "secondary", manager.clear_finished),
                          ("Tout annuler", "secondary", manager.cancel_all), ("Fermer", "primary", self.accept))
         self._folder = folder
-        self._rows: dict = {}
+        self._rows: list = []
+        self._open: set = set()   # séries dépliées
+        self._sig = None
         manager.changed.connect(self.refresh)
+        self.refresh()
+
+    def _style_filters(self):
+        for key, b in self._filter_btns.items():
+            b.setObjectName("primary" if key == self._filter else "secondary")
+            b.style().unpolish(b)
+            b.style().polish(b)
+
+    def _set_filter(self, key: str):
+        self._filter = key
+        self._style_filters()
+        self.refresh()
+
+    def _toggle_show(self, show: str):
+        self._open.symmetric_difference_update({show})
         self.refresh()
 
     def _change_folder(self):
@@ -678,30 +709,50 @@ class DownloadsDialog(CardDialog):
             self.refresh()
 
     def refresh(self):
+        """Films : une ligne chacun ; séries : un bloc par série (épisodes dépliables). Lignes reconstruites
+        seulement si la file, le filtre ou les séries dépliées changent ; sinon simple mise à jour."""
         self.folder.setText(f"<span style='color:{ui.C['muted']}'>Dossier :</span> {self._folder}")
-        jobs = list(self.manager.jobs)
-        for job in list(self._rows):
-            if job not in jobs:
-                self._rows.pop(job).deleteLater()
-        if not jobs and not self._rows:
-            while self.list.count():
-                item = self.list.takeAt(0)
-                if item.widget() is not None:
-                    item.widget().deleteLater()
-            empty = QLabel("Aucun téléchargement. Bouton ⬇ sur la fiche d'un film ou d'une série.")
+        jobs = [j for j in self.manager.jobs if self._filter == "all" or j.kind == self._filter]
+        sig = (self._filter, tuple(id(j) for j in jobs), tuple(sorted(self._open)))
+        if sig == self._sig:
+            for row in self._rows:
+                if hasattr(row, "update_state"):
+                    row.update_state()
+            return
+        self._sig = sig
+        while self.list.count():
+            item = self.list.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._rows = []
+        if not jobs:
+            empty = QLabel({"movie": "Aucun film dans les téléchargements.",
+                            "episode": "Aucune série dans les téléchargements."}.get(
+                self._filter, "Aucun téléchargement. Bouton ⬇ sur la fiche d'un film ou d'une série."))
             empty.setObjectName("cardNote")
             self.list.addWidget(empty)
-            self._rows[None] = empty
+            self._rows.append(empty)
             return
-        if None in self._rows and jobs:
-            self._rows.pop(None).deleteLater()
+        shows: dict = {}
         for job in jobs:
-            row = self._rows.get(job)
-            if row is None:
-                row = _JobRow(job, self.manager)
-                self._rows[job] = row
-                self.list.addWidget(row)
+            if job.kind == "episode" and job.show:
+                if job.show not in shows:
+                    shows[job.show] = []
+                    self._rows.append(("show", job.show))  # place de la série : celle de son 1er épisode
+                shows[job.show].append(job)
+            else:
+                self._rows.append(job)
+        rows = []
+        for entry in self._rows:
+            if isinstance(entry, tuple):
+                show = entry[1]
+                row = _ShowRow(show, shows[show], self.manager, show in self._open, self._toggle_show)
+            else:
+                row = _JobRow(entry, self.manager)
+            self.list.addWidget(row)
             row.update_state()
+            rows.append(row)
+        self._rows = rows
 
     def done(self, result):
         try:
@@ -711,8 +762,104 @@ class DownloadsDialog(CardDialog):
         super().done(result)
 
 
+class _ShowRow(QFrame):
+    """Série dans la fenêtre Téléchargements : un seul bloc (progression d'ensemble, épisode en cours), épisodes
+    par saison dépliables."""
+
+    def __init__(self, show: str, jobs: list, manager, opened: bool, on_toggle):
+        super().__init__()
+        self.show_name, self.jobs, self.manager = show, jobs, manager
+        self.setObjectName("drawerGroup")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 8, 8, 8)
+        lay.setSpacing(5)
+        top = QHBoxLayout()
+        self.title = QLabel(f"<b>{_esc(show)}</b>")
+        self.title.setObjectName("cardText")
+        self.title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        toggle = QPushButton(("Masquer les épisodes  ▴" if opened else f"{len(jobs)} épisodes  ▾"))
+        toggle.setObjectName("drawerRow")
+        toggle.setCursor(Qt.PointingHandCursor)
+        toggle.clicked.connect(lambda: on_toggle(show))
+        self.action = QPushButton()
+        self.action.setObjectName("drawerRow")
+        self.action.setCursor(Qt.PointingHandCursor)
+        self.action.clicked.connect(self._act)
+        top.addWidget(self.title, 1)
+        top.addWidget(toggle)
+        top.addWidget(self.action)
+        lay.addLayout(top)
+        self.bar = QProgressBar()
+        self.bar.setObjectName("bar")
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        lay.addWidget(self.bar)
+        self.state = QLabel()
+        self.state.setObjectName("cardNote")
+        lay.addWidget(self.state)
+        self.children_rows = []
+        if opened:
+            season = None
+            for j in sorted(jobs, key=lambda j: (j.season, j.title)):
+                if j.season != season:
+                    season = j.season
+                    head = QLabel(f"Saison {season}")
+                    head.setObjectName("fieldLabel")
+                    lay.addWidget(head)
+                row = _JobRow(j, manager, title=j.title.partition(" · ")[2] or j.title)
+                lay.addWidget(row)
+                self.children_rows.append(row)
+
+    def update_state(self):
+        jobs = self.jobs
+        n = len(jobs)
+        done = [j for j in jobs if j.state == "done"]
+        active = [j for j in jobs if j.state in ("waiting", "running")]
+        failed = [j for j in jobs if j.state == "error"]
+        running = next((j for j in jobs if j.state == "running"), None)
+        # Progression d'ensemble : épisodes terminés + avancement de celui en cours
+        total_steps = len(done) + len(active)
+        value = (len(done) + (running.progress if running else 0)) / total_steps if total_steps else 1.0
+        self.bar.setValue(int(value * 1000))
+        self.bar.setVisible(bool(active))
+        size = sum(j.total or j.done for j in done) / 1_073_741_824
+        parts = [f"{len(done)} / {n} épisode{'s' if n > 1 else ''} terminé{'s' if len(done) > 1 else ''}"]
+        if running is not None:
+            code = running.title.partition(" · ")[2].partition(" · ")[0]
+            pct = f" {int(running.progress * 100)} %" if running.total else ""
+            parts.append(f"en cours : {code}{pct} · {running.speed / 1_048_576:.1f} Mo/s")
+        elif active:
+            parts.append(f"{len(active)} en attente")
+        if failed:
+            parts.append(f"{len(failed)} en échec")
+        if not active and done:
+            parts.append(f"{size:.1f} Go")
+        self.state.setText("  ·  ".join(parts))
+        self.action.setText("Annuler la série" if active else ("Tout réessayer" if failed else "Afficher"))
+        for row in self.children_rows:
+            row.update_state()
+
+    def _act(self):
+        active = [j for j in self.jobs if j.state in ("waiting", "running")]
+        failed = [j for j in self.jobs if j.state == "error"]
+        if active:
+            for j in active:
+                self.manager.cancel(j)
+        elif failed:
+            for j in failed:
+                self.manager.retry(j)
+        else:
+            done = [j for j in self.jobs if j.state == "done"]
+            if done:  # dossier de la série (au-dessus des dossiers « Saison xx »)
+                _open_folder(str(done[0].dest.parent.parent))
+
+
+def _esc(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 class _JobRow(QFrame):
-    def __init__(self, job, manager):
+    def __init__(self, job, manager, title: str = ""):
         super().__init__()
         self.job, self.manager = job, manager
         self.setObjectName("drawerGroup")
@@ -720,7 +867,7 @@ class _JobRow(QFrame):
         lay.setContentsMargins(12, 8, 8, 8)
         lay.setSpacing(5)
         top = QHBoxLayout()
-        self.title = QLabel(job.title)
+        self.title = QLabel(title or job.title)
         self.title.setObjectName("cardText")
         self.title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.action = QPushButton()

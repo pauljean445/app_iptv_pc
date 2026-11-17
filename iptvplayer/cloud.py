@@ -258,6 +258,11 @@ class Session:
     def _doc_url(self, path: str) -> str:
         return f"{DB_URL}/households/{self.uid}" + (f"/{path}" if path else "")
 
+    def get_root_doc(self, path: str, timeout: int = 15) -> dict | None:
+        """Document hors des foyers (base commune des notes IMDb : imdb/sNN), champs décodés ; None s'il n'existe pas."""
+        r = _call("GET", f"{DB_URL}/{path}", token=self._token(), timeout=timeout)
+        return None if r is None else {k: decode(v) for k, v in (r.get("fields") or {}).items()}
+
     def get_doc(self, path: str, timeout: int = 15) -> dict | None:
         """Champs du document (décodés), None s'il n'existe pas."""
         r = _call("GET", self._doc_url(path), token=self._token(), timeout=timeout)

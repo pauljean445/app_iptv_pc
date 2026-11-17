@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListView,
     QMenu,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -687,9 +688,13 @@ class TileModel(QAbstractListModel):
 class TileDelegate(QStyledItemDelegate):
     """Dessine une vignette : image (affiche ou logo), barre de progression, titre et sous-titre."""
 
-    def __init__(self, images, width: int, poster: bool, parent=None):
+    def __init__(self, images, width: int, poster: bool, parent=None, tile_fn=None):
         super().__init__(parent)
         self.images = images
+        self.tile_fn = tile_fn  # index -> Tile (vue branchée sur un autre modèle que TileModel)
+        self.set_size(width, poster)
+
+    def set_size(self, width: int, poster: bool):
         self.width = width
         self.poster = poster
         self.img_h = int(width * 1.5) if poster else int(width * 0.62)
@@ -704,7 +709,7 @@ class TileDelegate(QStyledItemDelegate):
         return QRectF(r.right() - 31, r.y() + 7, 24, 24)
 
     def paint(self, p: QPainter, option, index):
-        tile = index.model().tiles[index.row()]
+        tile = self.tile_fn(index) if self.tile_fn else index.model().tiles[index.row()]
         r = QRectF(option.rect).adjusted(6, 6, -6, -6)
         hover = bool(option.state & QStyle.State_MouseOver) or bool(option.state & QStyle.State_HasFocus)
         p.save()
@@ -872,6 +877,68 @@ class Mosaic(QListView):
             self._emit(self.currentIndex())
         elif event.key() == Qt.Key_Delete:
             self._remove(self.currentIndex())
+        else:
+            super().keyPressEvent(event)
+
+
+class GridView(QListView):
+    """Mosaïque d'un onglet (Direct, Films, Séries) : vignettes sur plusieurs rangées, défilement vertical.
+    Branchée sur le modèle de la liste (mêmes filtres) ; tile_fn donne la vignette d'une ligne."""
+
+    def __init__(self, images, tile_fn):
+        super().__init__()
+        self.setViewMode(QListView.IconMode)
+        self.setFlow(QListView.LeftToRight)
+        self.setWrapping(True)
+        self.setResizeMode(QListView.Adjust)
+        self.setMovement(QListView.Static)
+        self.setUniformItemSizes(True)
+        self.setLayoutMode(QListView.Batched)  # 13 000 films : la 1re page s'affiche tout de suite
+        self.setBatchSize(400)
+        self.setSpacing(4)
+        self.setDragEnabled(False)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setVerticalScrollMode(QListView.ScrollPerPixel)
+        self.verticalScrollBar().setSingleStep(40)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)  # largeur stable (pas d'aller-retour de mise en page)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setEditTriggers(QListView.NoEditTriggers)
+        self.setMouseTracking(True)
+        self.viewport().setAttribute(Qt.WA_Hover)
+        self.setStyleSheet("QListView { background: transparent; }")
+        self.delegate = TileDelegate(images, 150, True, self, tile_fn=tile_fn)
+        self.setItemDelegate(self.delegate)
+
+    def set_mode(self, poster: bool):
+        """Affiches (films, séries) ou logos (chaînes)."""
+        self.poster = poster
+        self._fit()
+
+    def _fit(self):
+        """Largeur des vignettes : au moins 150 px (affiches) / 176 px (logos), agrandies pour que les colonnes
+        remplissent toute la largeur (pas de vide à droite)."""
+        poster = getattr(self, "poster", True)
+        base, s = (150 if poster else 176), self.spacing()
+        # QListView (IconMode) : un espacement avant la 1re vignette puis un après chacune
+        avail = self.viewport().width() - s
+        cols = max(1, avail // (base + 12 + s))
+        width = max(base, avail // cols - 12 - s - 1)
+        if (self.delegate.width, self.delegate.poster) != (width, poster):
+            self.delegate.set_size(width, poster)
+            self.scheduleDelayedItemsLayout()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit()
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        index = self.indexAt(event.position().toPoint())
+        self.viewport().setCursor(Qt.PointingHandCursor if index.isValid() else Qt.ArrowCursor)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self.currentIndex().isValid():
+            self.clicked.emit(self.currentIndex())
         else:
             super().keyPressEvent(event)
 
@@ -1117,6 +1184,10 @@ class DetailsPage(QScrollArea):
         col.addSpacing(6)
         col.addWidget(self.plot)
         col.addWidget(self.credits)
+        # Série : saisons et épisodes directement sur la fiche (comme sur la TV et le téléphone)
+        self.episodes = EpisodesBox()
+        col.addSpacing(6)
+        col.addWidget(self.episodes)
         col.addStretch(1)
         row.addLayout(col, 1)
         for w in (self.title, self.meta, self.plot, self.credits):
@@ -1129,6 +1200,243 @@ class DetailsPage(QScrollArea):
 
     def set_tracks(self, audio: list, subs: list, note: str = ""):
         self.tracks.set_entries(audio, subs, note)
+
+
+class EpisodesBox(QWidget):
+    """Saisons (boutons) et épisodes d'une série, sur la fiche. Une ligne d'épisode : vignette, titre, état (vu,
+    en cours, durée), progression, ▶ et ⬇ ; clic = lecture, clic droit = menu (vu / non vu, depuis le début…)."""
+
+    seasonChosen = Signal(object)  # saison (int) ou journée des replays (texte)
+
+    def __init__(self):
+        super().__init__()
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        self.head = QLabel("Épisodes")
+        self.head.setObjectName("trackTitle")
+        v.addWidget(self.head)
+        self.season_flow = FlowLayout()
+        box = QWidget()
+        box.setLayout(self.season_flow)
+        box.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        v.addWidget(box)
+        self.rows = QVBoxLayout()
+        self.rows.setSpacing(6)
+        v.addLayout(self.rows)
+        self.msg = QLabel()
+        self.msg.setObjectName("detCredits")
+        v.addWidget(self.msg)
+        self._thumbs: list = []
+        self.hide()
+
+    def set_message(self, text: str):
+        self._clear_rows()
+        self.season_flow.clear()
+        self.msg.setText(text)
+        self.msg.setVisible(bool(text))
+        self.setVisible(bool(text))
+
+    def _clear_rows(self):
+        while self.rows.count():
+            item = self.rows.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._thumbs = []
+
+    def set_episodes(self, seasons: list, current, rows: list, images, head: str = "Épisodes", chip=None):
+        """seasons : saisons (ou journées des replays), current : celle affichée ; chip(s) : libellé du bouton.
+        rows : [dict(title, sub, desc, progress, accent, logo (None : pas de vignette), play, menu, download)]."""
+        self.msg.hide()
+        self.head.setText(head)
+        self.season_flow.clear()
+        for s in seasons:
+            b = QPushButton(chip(s) if chip else f"Saison {s}")
+            b.setObjectName("langChip")
+            b.setCheckable(True)
+            b.setChecked(s == current)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda _=False, s=s: self.seasonChosen.emit(s))
+            self.season_flow.addWidget(b)
+        self._clear_rows()
+        self.images = images
+        self.rows.setSpacing(4 if rows and rows[0].get("kind") == "program" else 6)
+        for r in rows:
+            w = _ProgramRow(r) if r.get("kind") == "program" else _EpisodeRow(r)
+            self.rows.addWidget(w)
+            if w.thumb is not None:
+                self._thumbs.append((w.thumb, r.get("logo") or ""))
+        self.refresh_images()
+        self.show()
+
+    def refresh_images(self):
+        for label, url in self._thumbs:
+            if label.pixmap() is not None and not label.pixmap().isNull():
+                continue
+            pm = self.images.pixmap(url, _EpisodeRow.THUMB.width(), _EpisodeRow.THUMB.height()) if url else None
+            if pm is not None:
+                label.setPixmap(pm)
+
+
+class _ProgramRow(QFrame):
+    """Programme de replay : heure de début en grand à gauche, titre, durée / état, deux lignes de résumé, ▶."""
+
+    def __init__(self, r: dict):
+        super().__init__()
+        self.r = r
+        self.thumb = None
+        self.setObjectName("progRow")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet(
+            f"#progRow {{ background: {C['surface']}; border: 1px solid transparent; border-radius: 10px; }}"
+            f"#progRow:hover {{ border-color: {C['accent']}; }}"
+            + (f"#progRow {{ border-color: {C['accent']}; background: rgba(123, 102, 255, 40); }}" if r.get("playing") else ""))
+        h = QHBoxLayout(self)
+        h.setContentsMargins(14, 10, 10, 10)
+        h.setSpacing(16)
+        times = QVBoxLayout()
+        times.setSpacing(0)
+        start = QLabel(r["start"])
+        f = QFont(start.font())
+        f.setPointSizeF(14)
+        f.setBold(True)
+        start.setFont(f)
+        start.setStyleSheet(f"color: {C['accent_hi']}; background: transparent;")
+        end = QLabel(r["end"])
+        end.setStyleSheet(f"color: {C['muted']}; font-size: 9pt; background: transparent;")
+        times.addWidget(start)
+        times.addWidget(end)
+        times.addStretch(1)
+        tbox = QWidget()
+        tbox.setLayout(times)
+        tbox.setMinimumWidth(start.fontMetrics().horizontalAdvance("00:00") + 18)  # heure jamais rognée
+        tbox.setStyleSheet("background: transparent;")
+        h.addWidget(tbox, 0, Qt.AlignTop)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        title = QLabel(r["title"])
+        title.setStyleSheet(f"color: {C['text']}; font-size: 11pt; font-weight: 600; background: transparent;")
+        title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        title.setToolTip(r["title"])
+        top.addWidget(title, 1)
+        col.addLayout(top)
+        meta = QLabel()
+        meta.setTextFormat(Qt.RichText)
+        bits = [r.get("duration", "")]
+        if r.get("playing"):
+            bits.append(f"<span style='color:{C['accent_hi']}'>▶ en lecture</span>")
+        elif r.get("live"):
+            bits.append(f"<span style='color:{C['live']}'>● en cours</span>")
+        meta.setText("  ·  ".join(b for b in bits if b))
+        meta.setStyleSheet(f"color: {C['muted']}; font-size: 9pt; background: transparent;")
+        col.addWidget(meta)
+        if r.get("desc"):
+            desc = QLabel(r["desc"])
+            desc.setWordWrap(True)
+            desc.setStyleSheet(f"color: {C['muted']}; font-size: 9.5pt; background: transparent;")
+            desc.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            desc.setToolTip(r.get("full_desc", ""))
+            col.addSpacing(3)
+            col.addWidget(desc)
+        h.addLayout(col, 1)
+        b = QPushButton()
+        b.setObjectName("secondary")
+        b.setIcon(icon("play", C["text"]))
+        b.setIconSize(QSize(16, 16))
+        b.setToolTip("Lire")
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFocusPolicy(Qt.NoFocus)
+        b.clicked.connect(lambda _=False: r["play"]())
+        h.addWidget(b, 0, Qt.AlignVCenter)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.r["play"]()
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        self.r["menu"](event.globalPos())
+
+
+class _EpisodeRow(QFrame):
+    THUMB = QSize(128, 72)
+
+    def __init__(self, r: dict):
+        super().__init__()
+        self.r = r
+        self.setObjectName("drawerGroup")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Clic : lire  ·  clic droit : vu / non vu, depuis le début…")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(8, 8, 8, 8)
+        h.setSpacing(12)
+        thumb_box = QVBoxLayout()
+        thumb_box.setSpacing(0)
+        self.thumb = None
+        if r.get("logo", "") is not None:  # programmes de replay : pas de vignette
+            self.thumb = QLabel()
+            self.thumb.setFixedSize(self.THUMB)
+            self.thumb.setAlignment(Qt.AlignCenter)
+            self.thumb.setStyleSheet(f"background: {C['surface2']}; border-radius: 6px;")
+            thumb_box.addWidget(self.thumb)
+        if r.get("progress", -1) >= 0:
+            bar = QProgressBar()
+            bar.setObjectName("bar")
+            bar.setRange(0, 1000)
+            bar.setTextVisible(False)
+            bar.setFixedWidth(self.THUMB.width())
+            bar.setValue(int(min(1.0, r["progress"]) * 1000))
+            thumb_box.addSpacing(4)
+            thumb_box.addWidget(bar)
+        thumb_box.addStretch(1)
+        if thumb_box.count() > 1:
+            h.addLayout(thumb_box)
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        title = QLabel(r["title"])
+        title.setObjectName("cardText")
+        title.setWordWrap(True)
+        title.setStyleSheet("font-weight: 600;")
+        title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        sub = QLabel(r.get("sub", ""))
+        sub.setObjectName("cardNote")
+        if r.get("accent"):
+            sub.setStyleSheet(f"color: {C['accent_hi']};")
+        col.addWidget(title)
+        col.addWidget(sub)
+        if r.get("desc"):
+            desc = QLabel(r["desc"])
+            desc.setObjectName("cardNote")
+            desc.setWordWrap(True)
+            desc.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            col.addWidget(desc)
+        col.addStretch(1)
+        h.addLayout(col, 1)
+        for name, tip, key in (("play", "Lire", "play"), ("download", "Télécharger l'épisode", "download")):
+            if r.get(key) is None:
+                continue
+            b = QPushButton()
+            b.setObjectName("secondary")
+            b.setIcon(icon(name, C["text"]))
+            b.setIconSize(QSize(18, 18))
+            b.setToolTip(tip)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(lambda _=False, f=r[key]: f())
+            h.addWidget(b, 0, Qt.AlignVCenter)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.r["play"]()
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        self.r["menu"](event.globalPos())
 
 
 class TracksBox(QWidget):

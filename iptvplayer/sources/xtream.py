@@ -169,7 +169,7 @@ class XtreamClient:
                 name=str(s.get("name") or "").strip(), url=self.movie_url(sid, ext), ext=ext,
                 group=vod_c.get(str(s.get("category_id")), ""), logo=s.get("stream_icon") or "",
                 kind="movie", key=f"x:movie:{sid}", stream_id=str(sid), rating=_rating(s.get("rating")),
-                year=_year(s.get("year") or s.get("releasedate")),
+                year=_year(s.get("year") or s.get("releasedate")), tmdb=str(s.get("tmdb") or ""),
             ))
         for s in sorted(series, key=lambda s: order.get(str(s.get("category_id")), 1 << 30)):
             sid = s.get("series_id")
@@ -180,16 +180,26 @@ class XtreamClient:
                 logo=s.get("cover") or "", kind="series", key=f"x:series:{sid}", stream_id=str(sid),
                 plot=s.get("plot") or "", rating=_rating(s.get("rating")), genre=s.get("genre") or "",
                 year=_year(s.get("releaseDate") or s.get("release_date")),
-                cast=s.get("cast") or "", director=s.get("director") or "",
+                cast=s.get("cast") or "", director=s.get("director") or "", tmdb=str(s.get("tmdb") or ""),
             ))
         if not items:
             raise RuntimeError("Le serveur n'a renvoyé aucune chaîne.")
         return items
 
     # ---- Détails (à la demande) ------------------------------------------ #
+    # Le fournisseur prépare la fiche d'un film à la première demande : cette réponse-là est vide, la fiche
+    # complète arrive ~3 s plus tard (mesuré le 17/11/2026). On redemande donc quelques fois.
+    INFO_RETRY_S = (2.5, 3, 4)
+
     def fill_movie_info(self, it: Item) -> None:
-        data = self.api("get_vod_info", timeout=30, vod_id=it.stream_id)
-        info = data.get("info") if isinstance(data, dict) else None
+        info = None
+        for wait in (0,) + self.INFO_RETRY_S:
+            if wait:
+                time.sleep(wait)
+            data = self.api("get_vod_info", timeout=30, vod_id=it.stream_id)
+            info = data.get("info") if isinstance(data, dict) else None
+            if isinstance(info, dict) and any(info.values()):
+                break
         if isinstance(info, dict):
             it.plot = info.get("plot") or info.get("description") or it.plot
             it.genre = info.get("genre") or it.genre
@@ -213,6 +223,12 @@ class XtreamClient:
             show.genre = show.genre or info.get("genre") or ""
             show.rating = show.rating or _rating(info.get("rating"))
             show.logo = show.logo or info.get("cover") or ""
+            show.extra["tmdb_id"] = show.extra.get("tmdb_id") or str(info.get("tmdb") or "")
+            show.cast = show.cast or info.get("cast") or ""
+            show.director = show.director or info.get("director") or ""
+            show.year = show.year or _year(info.get("releaseDate") or info.get("release_date"))
+            if not show.duration and _int(info.get("episode_run_time")) > 0:
+                show.duration = f"{_int(info.get('episode_run_time'))} min par épisode"
         raw = data.get("episodes") or {}
         groups = raw.values() if isinstance(raw, dict) else raw
         episodes: list[Item] = []
@@ -268,7 +284,9 @@ class XtreamClient:
                 duration=f"{minutes} min", info_loaded=True, extra={"title": title},
             ))
         programs.sort(key=lambda p: p.start, reverse=True)
-        return programs
+        # Le fournisseur renvoie parfois deux fois le même programme (même heure de début) : une seule fois chacun
+        seen: set = set()
+        return [p for p in programs if not (p.key in seen or seen.add(p.key))]
 
 
 _TIMESHIFT_RE = re.compile(r"^(.*/timeshift/[^/]+/[^/]+/)(\d+)/(\d{4}-\d{2}-\d{2}):(\d{2})-(\d{2})/([^/]+)$")

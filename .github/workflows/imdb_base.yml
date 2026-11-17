@@ -1,0 +1,27 @@
+# Base commune des notes IMDb (PC, TV, téléphone) : mise à jour chaque nuit par le compte « robot ».
+# Secrets du dépôt (Settings > Secrets and variables > Actions) : ROBOT_EMAIL, ROBOT_PASSWORD, HOUSEHOLDS.
+name: Notes IMDb
+
+on:
+  schedule:
+    - cron: "30 4 * * *"   # chaque nuit (04:30 UTC), après la publication du fichier IMDb du jour
+  workflow_dispatch:        # bouton « Run workflow » pour la lancer à la main
+
+permissions:
+  contents: read
+
+jobs:
+  imdb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Mise à jour de la base
+        env:
+          ROBOT_EMAIL: ${{ secrets.ROBOT_EMAIL }}
+          ROBOT_PASSWORD: ${{ secrets.ROBOT_PASSWORD }}
+          HOUSEHOLDS: ${{ secrets.HOUSEHOLDS }}
+        run: python tools/imdb_job.py

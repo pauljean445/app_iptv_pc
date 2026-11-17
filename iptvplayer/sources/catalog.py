@@ -13,7 +13,7 @@ from .. import config
 from .playlist import Item
 
 FILE = "catalog.bin"
-VERSION = 1
+VERSION = 2  # 2 : numéro TMDB (base IMDb commune)
 _KINDS = ("live", "movie", "series")
 
 
@@ -30,7 +30,7 @@ def save(src: dict, signature: str, items: list[Item], folder=None) -> None:
             continue
         g = groups.setdefault(it.group, len(groups))
         rows.append((_KINDS.index(it.kind), it.name, g, it.logo, it.stream_id, it.ext, it.tvg_id,
-                     it.archive_days, it.rating, it.year, it.plot, it.genre, it.cast, it.director))
+                     it.archive_days, it.rating, it.year, it.plot, it.genre, it.cast, it.director, it.tmdb))
     header = (VERSION, sys.version_info[:2], source_id(src), signature)
     blob = zlib.compress(marshal.dumps((header, list(groups), rows)), 6)
     folder = folder or config.profile_dir()  # dossier du profil (passé par l'appelant : thread)
@@ -55,7 +55,7 @@ def load(src: dict, client, folder=None) -> tuple[str, list[Item]] | None:
     live_url, movie_url = client.live_url, client.movie_url
     items = []
     append = items.append
-    for k, name, g, logo, sid, ext, tvg, archive, rating, year, plot, genre, cast, director in rows:
+    for k, name, g, logo, sid, ext, tvg, archive, rating, year, plot, genre, cast, director, tmdb in rows:
         kind = _KINDS[k]
         if kind == "live":
             url = live_url(sid)
@@ -65,5 +65,5 @@ def load(src: dict, client, folder=None) -> tuple[str, list[Item]] | None:
             url = ""
         append(Item(name=name, url=url, group=groups[g], logo=logo, tvg_id=tvg, kind=kind,
                     key=f"x:{kind}:{sid}", stream_id=sid, ext=ext, archive_days=archive,
-                    rating=rating, year=year, plot=plot, genre=genre, cast=cast, director=director))
+                    rating=rating, year=year, plot=plot, genre=genre, cast=cast, director=director, tmdb=tmdb))
     return header[3], items

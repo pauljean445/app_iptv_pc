@@ -39,6 +39,9 @@ class Job:
     error: str = ""
     speed: float = 0.0    # octets / s
     started: float = field(default_factory=time.time)
+    kind: str = "movie"   # movie | episode
+    show: str = ""        # épisode : nom de la série (regroupement dans la fenêtre Téléchargements)
+    season: int = 0
 
     @property
     def progress(self) -> float:
@@ -61,16 +64,18 @@ class DownloadManager(QObject):
         self._thread.start()
 
     # ---- File d'attente ---------------------------------------------------- #
-    def add(self, entries: list[tuple[str, str, Path]]) -> int:
-        """entries : (libellé, url, fichier final). Ignore les fichiers déjà téléchargés ou déjà en file.
-        Retourne le nombre de téléchargements ajoutés."""
+    def add(self, entries: list[tuple]) -> int:
+        """entries : (libellé, url, fichier final[, infos]) ; infos : {"kind", "show", "season"} (épisode d'une
+        série). Ignore les fichiers déjà téléchargés ou déjà en file. Retourne le nombre de téléchargements ajoutés."""
         added = 0
         with self._lock:
             queued = {j.dest for j in self.jobs if j.state in ("waiting", "running")}
-            for title, url, dest in entries:
+            for title, url, dest, *rest in entries:
                 if dest in queued or dest.exists():
                     continue
-                self.jobs.append(Job(title, url, dest))
+                info = rest[0] if rest else {}
+                self.jobs.append(Job(title, url, dest, kind=info.get("kind", "movie"), show=info.get("show", ""),
+                                     season=info.get("season", 0)))
                 added += 1
         if added:
             self._wake.set()

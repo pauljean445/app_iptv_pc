@@ -1882,6 +1882,8 @@ class MainWindow(QMainWindow):
         else:
             self.model.refresh()
         self._refresh_home()
+        if self.pages.currentWidget() is self.search_page:  # coches « vu » des résultats
+            self._run_search()
         if self.details_item is not None:
             self._show_details(self.details_item)
 
@@ -2192,7 +2194,7 @@ class MainWindow(QMainWindow):
                 sub = " · ".join(x for x in ((_year_of(it), _short_rating(it), _runtime_text(it)) if it.kind == "movie"
                                              else (_short_rating(it),)) if x)
                 pos, length = lib.resume_position(it.key), lib.progress.get(it.key, {}).get("len", 0)
-                out.append(ui.Tile(it, it.name, sub, pos / length if pos and length else -1))
+                out.append(ui.Tile(it, it.name, sub, pos / length if pos and length else -1, seen=lib.is_done(it.key)))
             return out, len(found)
 
         (films, n_films), (series, n_series) = tiles("movie"), tiles("series")

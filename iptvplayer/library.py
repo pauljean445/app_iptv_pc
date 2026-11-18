@@ -172,9 +172,9 @@ class Library:
         if not finished and pos <= 0:
             return
         if item.kind == "movie":
-            if finished:
+            if finished:  # fini : reste dans « Vu récemment », marqué vu (hors de « En cours »)
                 self._drop("progress", item.key)
-                self._drop("recent", item.key)
+                self._put("recent", item.key, {"kind": "movie", "name": item.name, "done": True})
             else:
                 if pos >= MIN_RESUME_MS:
                     self._put("progress", item.key, {"pos": pos, "len": length})
@@ -193,14 +193,34 @@ class Library:
             all_keys = {e.key for e in (show.episodes or [])}
             if all_keys:
                 entry["total"] = len(all_keys)
+            # Toute la série vue : reste dans « Vu récemment », marquée vue (épisodes vus gardés)
             if all_keys and all_keys <= self.watched_keys(show.key):
-                # Toute la série a été vue : on la retire de « Vu récemment »
-                self._drop("recent", show.key)
-                for k in all_keys:
-                    self._drop("progress", k)
-                    self._drop("watched", k)
+                entry["done"] = True
             else:
-                self._put("recent", show.key, entry)
+                entry.pop("done", None)
+            self._put("recent", show.key, entry)
+
+    def mark_done(self, item) -> None:
+        """« Déjà vu » : le film (ou tous les épisodes connus de la série) passe en vu, dans « Vu récemment »."""
+        if item.kind == "movie":
+            self._drop("progress", item.key)
+            self._put("recent", item.key, {"kind": "movie", "name": item.name, "done": True})
+            return
+        eps = item.episodes or []
+        if not eps:
+            return
+        for e in eps:
+            self._drop("progress", e.key)
+            if e.key not in self.watched:
+                self._put("watched", e.key, {"s": item.key})
+        last = eps[-1]
+        label = f"S{last.season:02d}E{last.episode:02d}" if (last.season or last.episode) else last.name
+        self._put("recent", item.key, {"kind": "series", "name": item.name, "last_ep": last.key,
+                                       "last_label": label, "total": len(eps), "done": True})
+
+    def is_done(self, key: str) -> bool:
+        """Film fini / série entièrement vue (« Déjà vu » ou lecture jusqu'au bout)."""
+        return bool((self.recent.get(key) or {}).get("done"))
 
     def recent_keys(self, kind: str) -> list[str]:
         rows = [(v.get("t", 0), k) for k, v in self.recent.items() if v.get("kind") == kind]

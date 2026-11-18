@@ -616,7 +616,7 @@ class ListDelegate(QStyledItemDelegate):
         sym = QFont(option.font)
         sym.setPointSizeF(option.font.pointSizeF() * 1.25)
         p.setFont(sym)
-        for flag, char, color in ((row.fav, "★", C["accent_hi"]), (row.watched, "✓", "#5FD39A")):
+        for flag, char, color in ((row.fav, "★", C["accent_hi"]), (row.watched, "✓", C["accent_hi"])):
             if flag:
                 p.setPen(QColor(color))
                 p.drawText(QRectF(right - 20, r.y(), 20, r.height()), Qt.AlignCenter, char)
@@ -668,6 +668,37 @@ class Tile:
     title: str
     subtitle: str = ""
     progress: float = -1.0  # 0..1, ou -1 sans barre de progression
+    seen: bool = False      # film / série vus : petite coche mauve en haut à droite
+
+
+def paint_seen_badge(p: QPainter, r: QRectF):
+    """Coche « vu » : disque mauve, coche blanche (vignettes, épisodes)."""
+    p.save()
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(C["accent"]))
+    p.drawEllipse(r)
+    pen = QPen(QColor("white"), max(1.6, r.width() * 0.1))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    x, y, w = r.x(), r.y(), r.width()
+    path = QPainterPath(QPointF(x + w * 0.28, y + w * 0.52))
+    path.lineTo(QPointF(x + w * 0.44, y + w * 0.67))
+    path.lineTo(QPointF(x + w * 0.73, y + w * 0.36))
+    p.setBrush(Qt.NoBrush)
+    p.drawPath(path)
+    p.restore()
+
+
+def seen_badge_pixmap(size: int = 22) -> QPixmap:
+    pm = QPixmap(size * 2, size * 2)
+    pm.setDevicePixelRatio(2)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    paint_seen_badge(p, QRectF(0.5, 0.5, size - 1, size - 1))
+    p.end()
+    return pm
 
 
 class TileModel(QAbstractListModel):
@@ -756,6 +787,9 @@ class TileDelegate(QStyledItemDelegate):
             p.setPen(QPen(QColor(C["accent_hi"]), 2))
             p.drawPath(path)
         view = self.parent()
+        removing = bool(option.state & QStyle.State_MouseOver) and getattr(view, "removable", False)
+        if getattr(tile, "seen", False) and not removing:  # la croix « retirer » prend sa place au survol
+            paint_seen_badge(p, self.remove_rect(option.rect))
         if option.state & QStyle.State_MouseOver and getattr(view, "removable", False):
             badge = self.remove_rect(option.rect)
             over = badge.contains(getattr(view, "hover_pos", QPointF(-1, -1)))
@@ -1271,11 +1305,13 @@ class DetailsPage(QScrollArea):
         self.alt_btn.setObjectName("secondary")
         self.fav_btn = QPushButton()
         self.fav_btn.setObjectName("secondary")
+        self.seen_btn = QPushButton()  # « Déjà vu » / « Retirer des vus » (film, série)
+        self.seen_btn.setObjectName("secondary")
         self.dl_btn = QPushButton()  # téléchargement sur le disque (film, épisode, saison d'une série)
         self.dl_btn.setObjectName("secondary")
         self.dl_btn.setIcon(icon("download", C["text"]))
         self.dl_btn.setIconSize(QSize(20, 20))
-        for b in (self.play_btn, self.alt_btn, self.fav_btn, self.dl_btn):
+        for b in (self.play_btn, self.alt_btn, self.fav_btn, self.seen_btn, self.dl_btn):
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
             btns.addWidget(b)
@@ -1505,6 +1541,12 @@ class _EpisodeRow(QFrame):
             self.thumb.setAlignment(Qt.AlignCenter)
             self.thumb.setStyleSheet(f"background: {C['surface2']}; border-radius: 6px;")
             thumb_box.addWidget(self.thumb)
+            if r.get("seen"):  # épisode vu : coche mauve en haut à droite de la vignette
+                badge = QLabel(self.thumb)
+                badge.setPixmap(seen_badge_pixmap(22))
+                badge.setStyleSheet("background: transparent;")
+                badge.setFixedSize(22, 22)
+                badge.move(self.THUMB.width() - 26, 4)
         if r.get("progress", -1) >= 0:
             bar = QProgressBar()
             bar.setObjectName("bar")

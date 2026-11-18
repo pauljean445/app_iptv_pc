@@ -664,6 +664,7 @@ class MainWindow(QMainWindow):
         self.details.play_btn.clicked.connect(lambda: self._details_action("play"))
         self.details.alt_btn.clicked.connect(lambda: self._details_action("alt"))
         self.details.fav_btn.clicked.connect(lambda: self._details_action("fav"))
+        self.details.seen_btn.clicked.connect(lambda: self._details_action("seen"))
         self.details.dl_btn.clicked.connect(self._details_download)
         self._ep_season: dict = {}  # saison affichée sur la fiche, par série
         self.details.episodes.seasonChosen.connect(self._on_season_chosen)
@@ -1237,7 +1238,7 @@ class MainWindow(QMainWindow):
         it = self.model.item(index.row())
         r = self._row(it)
         title = r.title + ("  ★" if r.fav else "")
-        return ui.Tile(it, title, r.subtitle, r.progress)
+        return ui.Tile(it, title, r.subtitle, r.progress, seen=r.watched and it.kind in ("movie", "series"))
 
     def _on_grid_clicked(self, index):
         """Vignette : affichage liste + fiche (film, série) ou lecture (chaîne), bouton « Mosaïque » pour revenir."""
@@ -1289,8 +1290,8 @@ class MainWindow(QMainWindow):
         movies = []
         for k in lib.recent_keys("movie"):
             it = by_key.get(k)
-            if it is None:
-                continue
+            if it is None or lib.is_done(k):
+                continue  # film fini : dans ◷ Vu récemment seulement
             prog = lib.progress.get(k, {})
             pos, length = prog.get("pos", 0), prog.get("len", 0)
             sub = f"Reprendre à {fmt_time(pos)}" if pos else "Commencé"
@@ -1301,7 +1302,7 @@ class MainWindow(QMainWindow):
             if it is None:
                 continue
             entry = lib.recent[k]
-            if self._series_done(it, entry):
+            if entry.get("done") or self._series_done(it, entry):
                 continue  # dernier épisode disponible vu : plus « en cours » (toujours dans ◷ Vu récemment)
             prog = lib.progress.get(entry.get("last_ep", ""), {})
             pos, length = prog.get("pos", 0), prog.get("len", 0)
@@ -1321,7 +1322,7 @@ class MainWindow(QMainWindow):
                 if it is None:
                     continue
                 bits = (_year_of(it), _short_rating(it), _runtime_text(it)) if tab == "movie" else (_short_rating(it),)
-                out.append(ui.Tile(it, it.name, " · ".join(b for b in bits if b)))
+                out.append(ui.Tile(it, it.name, " · ".join(b for b in bits if b), seen=lib.is_done(k)))
             return out
 
         wait = "Chargement du catalogue…"
@@ -2410,7 +2411,7 @@ class MainWindow(QMainWindow):
             bits = [_year_of(it), _short_rating(it), _runtime_text(it)] if it.kind == "movie" else [_short_rating(it)]
             sub = " · ".join(b for b in bits if b)
             entry = lib.recent.get(it.key) if it.kind == "series" else None
-            if entry:
+            if entry and not entry.get("done"):
                 sub = "En cours" + (f" · {entry['last_label']}" if entry.get("last_label") else "")
         if it.kind in RESUMABLE:
             pos = lib.resume_position(it.key)
@@ -2421,7 +2422,7 @@ class MainWindow(QMainWindow):
             title=title, subtitle=sub, progress=progress,
             fav=self.view == "list" and lib.is_favorite(self.tab, it.key),
             playing=self.current is not None and it.key == self.current.key and self._is_playing(),
-            watched=it.kind == "episode" and lib.is_watched(it),
+            watched=lib.is_watched(it) if it.kind == "episode" else (it.kind in ("movie", "series") and lib.is_done(it.key)),
         )
 
     def _on_images_ready(self):
@@ -2487,6 +2488,12 @@ class MainWindow(QMainWindow):
         lib = self.library
         d.alt_btn.hide()
         d.fav_btn.setVisible(it.kind in ("movie", "series"))
+        d.seen_btn.setVisible(it.kind in ("movie", "series"))
+        if it.kind in ("movie", "series"):
+            done = lib.is_done(it.key)
+            d.seen_btn.setText("Retirer des vus" if done else "✓  Déjà vu")
+            d.seen_btn.setToolTip("Le retirer de « Vu récemment »" if done else
+                                  "Marquer comme vu (vu ailleurs, hors ligne…) : dans « Vu récemment », plus « en cours »")
         d.dl_btn.setVisible(it.kind in ("movie", "series", "episode"))
         d.dl_btn.setToolTip({"movie": "Télécharger le film sur le disque",
                              "series": "Télécharger une saison (ou toute la série) sur le disque",
@@ -2532,6 +2539,7 @@ class MainWindow(QMainWindow):
         self._update_poster(ch)
         d.alt_btn.hide()
         d.dl_btn.hide()
+        d.seen_btn.hide()
         d.fav_btn.setVisible(True)
         fav = self.library.is_favorite("replay", ch.key)
         d.fav_btn.setText("★  Favori" if fav else "☆  Favori")
@@ -2611,14 +2619,12 @@ class MainWindow(QMainWindow):
             playing = self.current is not None and ep.key == self.current.key and self._is_playing()
             if playing:
                 sub = "▶ En lecture"
-            elif watched:
-                sub = "✓ Vu"
             elif pos:
                 sub = f"En cours · {fmt_time(pos)}"
             else:
                 sub = ep.duration or ""
             rows.append({
-                "title": label, "sub": sub, "accent": playing or watched or bool(pos),
+                "title": label, "sub": sub, "accent": playing or bool(pos), "seen": watched,
                 "progress": pos / length if pos and length else -1, "logo": ep.logo if ep.logo != it.logo else "",
                 "play": lambda ep=ep: self.play_item(ep, resume=True),
                 "menu": lambda gpos, ep=ep: self._episode_menu(ep, gpos),
@@ -2822,6 +2828,8 @@ class MainWindow(QMainWindow):
             return
         if which == "fav":
             self._toggle_favorite(it)
+        elif which == "seen":
+            self._set_done(it, not self.library.is_done(it.key))
         elif it.kind in RESUMABLE:
             self.play_item(it, resume=(which == "play"))
         elif it.kind == "series":
@@ -3028,6 +3036,11 @@ class MainWindow(QMainWindow):
             fav = lib.is_favorite(tab, target.key)
             menu.addAction(("Retirer des favoris" if fav else "Ajouter aux favoris") + "\tCtrl+D",
                            lambda: self._toggle_favorite(it))
+        if it.kind in ("movie", "series"):
+            if lib.is_done(it.key):
+                menu.addAction("Retirer des vus", lambda: self._set_done(it, False))
+            else:
+                menu.addAction("Déjà vu", lambda: self._set_done(it, True))
         if it.kind == "episode":
             if lib.is_watched(it):
                 menu.addAction("Marquer comme non vu", lambda: self._set_watched(it, False))
@@ -3060,6 +3073,26 @@ class MainWindow(QMainWindow):
         self.model.refresh()
         if self.details_item is not None and self.details_item.kind == "series":
             self._show_details(self.details_item)
+
+    def _set_done(self, it: playlist.Item, done: bool):
+        """« Déjà vu » (film, série : tous ses épisodes) / « Retirer des vus » (retiré de « Vu récemment »)."""
+        lib = self.library
+        if done and it.kind == "series" and not it.episodes:  # épisodes pas encore chargés : d'abord eux
+            if self.client is None:
+                return
+            client = self.client
+            self.statusBar().showMessage(f"Chargement des épisodes de {it.name}…", 4000)
+            run_async(lambda: client.load_episodes(it),
+                      lambda _r=None: it.episodes and self._set_done(it, True),
+                      lambda msg: self.statusBar().showMessage(f"Épisodes indisponibles : {msg}", 6000))
+            return
+        if done:
+            lib.mark_done(it)
+        else:
+            lib.remove_recent(it.key, [e.key for e in (it.episodes or [])])
+        lib.save()
+        self.statusBar().showMessage(f"{it.name} : {'marqué comme vu' if done else 'retiré des vus'}", 4000)
+        self._library_changed()
 
     def _remove_recent(self, key: str):
         it = self.by_key.get(key)
